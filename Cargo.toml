@@ -1,0 +1,20 @@
+[package]
+name = "verihymem-jailhouse"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+verified-hv-mem = { path = "../verified-hv-mem" }
+spin = "0.10.0"
+vstd = { version = "0.0.0-2026-06-14-0213", default-features = false, features = ["alloc"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
