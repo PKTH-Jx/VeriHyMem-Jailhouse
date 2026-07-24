@@ -1,18 +1,22 @@
-#![no_std]
-
 //! Executable adapter between Jailhouse and VeriHyMem.
 //!
 //! The initial integration owns one concrete AArch64 stage-2 page table. Jailhouse
-//! supplies an HVA-backed memory pool and its fixed HVA-to-PA offset; VeriHyMem owns
-//! allocation and all table mutations inside that pool.
+//! supplies a dedicated HVA-backed frame pool and its fixed HVA-to-PA offset;
+//! VeriHyMem's `GlobalFrameAllocator` owns frame allocation and all table mutations
+//! inside that pool. Rust heap allocation is a separate, unverified Jailhouse hook.
+#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod heap;
 
 use alloc::{boxed::Box, vec};
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 use core::ptr;
+use spin::Once;
 use verified_hv_mem::address::addr::{PAddr, VAddr};
 use verified_hv_mem::address::frame::{Frame, FrameSize, MemAttr};
 use verified_hv_mem::bitmap_allocator::bitmap_impl::BitAlloc1M;
@@ -20,7 +24,6 @@ use verified_hv_mem::global_allocator::GlobalAllocator;
 use verified_hv_mem::page_table::pt_arch::{PTArch, PTArchLevel};
 use verified_hv_mem::page_table::{Aarch64PTE, ExPageTable, PTConstants, PageTable};
 use vstd::prelude::Tracked;
-use spin::Once;
 
 pub const PAGE_SIZE: usize = 0x1000;
 pub const MIN_IPA_BITS: u8 = 44;
@@ -31,14 +34,19 @@ const BIT_ALLOC_CAPACITY: usize = 1 << 20;
 const BIT_ALLOC_ADDRESS_SPAN: usize = BIT_ALLOC_CAPACITY * PAGE_SIZE;
 
 #[derive(Clone, Copy)]
-struct MemPoolConfig {
+struct GlobalFramePoolConfig {
     hva_base: usize,
     frame_count: usize,
     hva_to_pa_offset: usize,
 }
 
-static MEM_POOL: Once<MemPoolConfig> = Once::new();
-static GLOBAL_ALLOCATOR: Once<GlobalAllocator<BitAlloc1M>> = Once::new();
+/// VeriHyMem's verified global frame allocator specialization.
+///
+/// This is distinct from the Rust global heap allocator in `heap.rs`.
+pub type GlobalFrameAllocator = GlobalAllocator<BitAlloc1M>;
+
+static GLOBAL_FRAME_POOL_CONFIG: Once<GlobalFramePoolConfig> = Once::new();
+static GLOBAL_FRAME_ALLOCATOR: Once<GlobalFrameAllocator> = Once::new();
 
 pub type ConcretePageTable = ExPageTable<BitAlloc1M, Aarch64PTE>;
 
@@ -51,46 +59,49 @@ pub enum Error {
     Busy = -16,
 }
 
-/// Initialize the shared VeriHyMem allocator from Jailhouse's reserved memory
-/// pool and return the singleton allocator used by all page-table handles.
+/// Initialize VeriHyMem's global frame allocator from its dedicated Jailhouse
+/// frame pool and return the singleton used by all page-table handles.
 ///
 /// The first call fixes the pool geometry. Later calls must describe the same
 /// pool; this permits independent page-table objects to share allocator state
 /// without wrapping the allocator into each object.
-unsafe fn init_global_allocator(
-    table_hva_base: usize,
-    table_frame_count: usize,
+///
+/// This prototype assumes the pool never exhausts. VeriHyMem's frame allocation
+/// interface is intentionally infallible; exhausting the pool is outside the
+/// integration proof boundary and may abort the hypervisor.
+unsafe fn init_global_frame_allocator(
+    frame_pool_hva_base: usize,
+    frame_pool_frame_count: usize,
     hva_to_pa_offset: usize,
-) -> Result<&'static GlobalAllocator<BitAlloc1M>, Error> {
-    let mem_pool = MEM_POOL.call_once(|| MemPoolConfig {
-        hva_base: table_hva_base,
-        frame_count: table_frame_count,
+) -> Result<&'static GlobalFrameAllocator, Error> {
+    let frame_pool = GLOBAL_FRAME_POOL_CONFIG.call_once(|| GlobalFramePoolConfig {
+        hva_base: frame_pool_hva_base,
+        frame_count: frame_pool_frame_count,
         hva_to_pa_offset,
     });
-    if mem_pool.hva_base != table_hva_base
-        || mem_pool.frame_count != table_frame_count
-        || mem_pool.hva_to_pa_offset != hva_to_pa_offset
+    if frame_pool.hva_base != frame_pool_hva_base
+        || frame_pool.frame_count != frame_pool_frame_count
+        || frame_pool.hva_to_pa_offset != hva_to_pa_offset
     {
         return Err(Error::Busy);
     }
 
-    Ok(GLOBAL_ALLOCATOR.call_once(|| {
-        let table_bytes = mem_pool.frame_count * PAGE_SIZE;
+    Ok(GLOBAL_FRAME_ALLOCATOR.call_once(|| {
+        let frame_pool_bytes = frame_pool.frame_count * PAGE_SIZE;
         unsafe {
-            ptr::write_bytes(mem_pool.hva_base as *mut u8, 0, table_bytes);
+            ptr::write_bytes(frame_pool.hva_base as *mut u8, 0, frame_pool_bytes);
         }
-        let allocator = GlobalAllocator::<BitAlloc1M>::default(PAddr(mem_pool.hva_base));
+        let frame_allocator = GlobalFrameAllocator::default(PAddr(frame_pool.hva_base));
 
-        // Frame permissions are proof-only. Jailhouse establishes the executable
-        // ownership of the pool; the integration intentionally omits tracked
-        // permission construction.
-        allocator.init(mem_pool.frame_count, Tracked::assume_new());
-        allocator
+        // This is the trusted handoff from Jailhouse's dedicated frame pool into
+        // VeriHyMem. Conditional on this permission matching the concrete pool,
+        // GlobalFrameAllocator's verified client-disjointness applies afterwards.
+        frame_allocator.init(frame_pool.frame_count, Tracked::assume_new());
+        frame_allocator
     }))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
 pub struct MapAttrs {
     pub readable: bool,
     pub writable: bool,
@@ -100,19 +111,74 @@ pub struct MapAttrs {
 
 impl MapAttrs {
     pub const fn normal(readable: bool, writable: bool, executable: bool) -> Self {
-        Self { readable, writable, executable, device: false }
+        Self {
+            readable,
+            writable,
+            executable,
+            device: false,
+        }
     }
 
     fn into_mem_attr(self) -> MemAttr {
         // Stage-2 mappings are guest-accessible by definition. The current
-        // AArch64 PTE backend does not encode execute permission; the value is
-        // retained here so the wrapper API does not lose Jailhouse information.
-        MemAttr::new(self.readable, self.writable, self.executable, true, self.device)
+        // AArch64 PTE backend does not encode execute permission; it is retained
+        // only in the input model and is not recovered by a later PTE query.
+        MemAttr::new(
+            self.readable,
+            self.writable,
+            self.executable,
+            true,
+            self.device,
+        )
+    }
+}
+
+/// C wire representation of [`MapAttrs`].
+///
+/// Rust `bool` only admits the bit patterns 0 and 1, so the FFI accepts bytes
+/// and validates them before constructing the internal representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct CMapAttrs {
+    pub readable: u8,
+    pub writable: u8,
+    pub executable: u8,
+    pub device: u8,
+}
+
+impl TryFrom<CMapAttrs> for MapAttrs {
+    type Error = Error;
+
+    fn try_from(attrs: CMapAttrs) -> Result<Self, Self::Error> {
+        fn flag(value: u8) -> Result<bool, Error> {
+            match value {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(Error::InvalidArgument),
+            }
+        }
+
+        Ok(Self {
+            readable: flag(attrs.readable)?,
+            writable: flag(attrs.writable)?,
+            executable: flag(attrs.executable)?,
+            device: flag(attrs.device)?,
+        })
+    }
+}
+
+impl From<MapAttrs> for CMapAttrs {
+    fn from(attrs: MapAttrs) -> Self {
+        Self {
+            readable: attrs.readable as u8,
+            writable: attrs.writable as u8,
+            executable: attrs.executable as u8,
+            device: attrs.device as u8,
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
 pub struct Mapping {
     pub ipa_base: usize,
     pub pa_base: usize,
@@ -120,7 +186,27 @@ pub struct Mapping {
     pub attrs: MapAttrs,
 }
 
-/// One executable VeriHyMem page table backed by a Jailhouse-owned HVA memory pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct CMapping {
+    pub ipa_base: usize,
+    pub pa_base: usize,
+    pub size: usize,
+    pub attrs: CMapAttrs,
+}
+
+impl From<Mapping> for CMapping {
+    fn from(mapping: Mapping) -> Self {
+        Self {
+            ipa_base: mapping.ipa_base,
+            pa_base: mapping.pa_base,
+            size: mapping.size,
+            attrs: mapping.attrs.into(),
+        }
+    }
+}
+
+/// One executable VeriHyMem page table backed by the dedicated global frame pool.
 pub struct JailhousePageTable {
     page_table: ConcretePageTable,
     ipa_bits: u8,
@@ -132,32 +218,59 @@ impl JailhousePageTable {
     ///
     /// # Safety
     ///
-    /// `table_hva_base..table_hva_base + table_frame_count * PAGE_SIZE` must be
-    /// valid, exclusively owned, writable hypervisor virtual memory for the
-    /// lifetime of the returned value. The pool must not be used by Jailhouse's
-    /// native page allocator while this value exists.
+    /// `frame_pool_hva_base..frame_pool_hva_base + frame_pool_frame_count * PAGE_SIZE`
+    /// must be the valid, exclusively assigned, writable pool represented by the
+    /// tracked permission assumed during global frame allocator initialization.
     pub unsafe fn new(
-        table_hva_base: usize,
-        table_frame_count: usize,
+        frame_pool_hva_base: usize,
+        frame_pool_frame_count: usize,
         hva_to_pa_offset: usize,
         ipa_bits: u8,
     ) -> Result<Self, Error> {
-        validate_mem_pool(table_hva_base, table_frame_count, hva_to_pa_offset, ipa_bits)?;
+        validate_global_frame_pool(
+            frame_pool_hva_base,
+            frame_pool_frame_count,
+            hva_to_pa_offset,
+            ipa_bits,
+        )?;
 
-        let allocator = unsafe {
-            init_global_allocator(table_hva_base, table_frame_count, hva_to_pa_offset)?
+        let frame_allocator = unsafe {
+            init_global_frame_allocator(
+                frame_pool_hva_base,
+                frame_pool_frame_count,
+                hva_to_pa_offset,
+            )?
         };
 
         let arch = PTArch(vec![
-            PTArchLevel { entry_count: 512, frame_size: FrameSize::Size512G },
-            PTArchLevel { entry_count: 512, frame_size: FrameSize::Size1G },
-            PTArchLevel { entry_count: 512, frame_size: FrameSize::Size2M },
-            PTArchLevel { entry_count: 512, frame_size: FrameSize::Size4K },
+            PTArchLevel {
+                entry_count: 512,
+                frame_size: FrameSize::Size512G,
+            },
+            PTArchLevel {
+                entry_count: 512,
+                frame_size: FrameSize::Size1G,
+            },
+            PTArchLevel {
+                entry_count: 512,
+                frame_size: FrameSize::Size2M,
+            },
+            PTArchLevel {
+                entry_count: 512,
+                frame_size: FrameSize::Size4K,
+            },
         ]);
-        let constants = PTConstants { arch, hva_to_pa_offset };
-        let page_table = ConcretePageTable::new(allocator, constants);
+        let constants = PTConstants {
+            arch,
+            hva_to_pa_offset,
+        };
+        let page_table = ConcretePageTable::new(frame_allocator, constants);
 
-        Ok(Self { page_table, ipa_bits, mapped_pages: 0 })
+        Ok(Self {
+            page_table,
+            ipa_bits,
+            mapped_pages: 0,
+        })
     }
 
     pub fn ipa_bits(&self) -> u8 {
@@ -166,6 +279,11 @@ impl JailhousePageTable {
 
     pub fn mapped_pages(&self) -> usize {
         self.mapped_pages
+    }
+
+    /// Physical address to install in the stage-2 root register.
+    pub fn root_pa(&self) -> usize {
+        self.page_table.0.pt_mem.root.0
     }
 
     pub fn map_page(&mut self, ipa: usize, pa: usize, attrs: MapAttrs) -> Result<(), Error> {
@@ -177,11 +295,11 @@ impl JailhousePageTable {
             size: FrameSize::Size4K,
             attr: attrs.into_mem_attr(),
         };
-        let Some(allocator) = GLOBAL_ALLOCATOR.get() else {
+        let Some(frame_allocator) = GLOBAL_FRAME_ALLOCATOR.get() else {
             return Err(Error::Busy);
         };
         self.page_table
-            .map(allocator, VAddr(ipa), frame)
+            .map(frame_allocator, VAddr(ipa), frame)
             .map_err(|_| Error::AlreadyMapped)?;
         self.mapped_pages += 1;
         Ok(())
@@ -189,11 +307,11 @@ impl JailhousePageTable {
 
     pub fn unmap_page(&mut self, ipa: usize) -> Result<(), Error> {
         self.validate_ipa_page(ipa)?;
-        let Some(allocator) = GLOBAL_ALLOCATOR.get() else {
+        let Some(frame_allocator) = GLOBAL_FRAME_ALLOCATOR.get() else {
             return Err(Error::Busy);
         };
         self.page_table
-            .unmap(allocator, VAddr(ipa))
+            .unmap(frame_allocator, VAddr(ipa))
             .map_err(|_| Error::NotMapped)?;
         self.mapped_pages -= 1;
         Ok(())
@@ -218,18 +336,18 @@ impl JailhousePageTable {
         })
     }
 
-    /// Destroy an empty page table and return its root frame to the memory pool.
+    /// Destroy an empty page table and return its root frame to the dedicated pool.
     ///
     /// If mappings remain, ownership of `self` is returned to the caller.
-    pub fn destroy_empty(self) -> Result<(), Self> {
+    pub fn destroy_empty(self: Box<Self>) -> Result<(), Box<Self>> {
         if self.mapped_pages != 0 {
             return Err(self);
         }
-        let Some(allocator) = GLOBAL_ALLOCATOR.get() else {
+        let Some(frame_allocator) = GLOBAL_FRAME_ALLOCATOR.get() else {
             return Err(self);
         };
-        let Self { page_table, .. } = self;
-        page_table.drop(allocator);
+        let Self { page_table, .. } = *self;
+        page_table.drop(frame_allocator);
         Ok(())
     }
 
@@ -250,37 +368,37 @@ impl JailhousePageTable {
     }
 }
 
-fn validate_mem_pool(
-    table_hva_base: usize,
-    table_frame_count: usize,
+fn validate_global_frame_pool(
+    frame_pool_hva_base: usize,
+    frame_pool_frame_count: usize,
     hva_to_pa_offset: usize,
     ipa_bits: u8,
 ) -> Result<(), Error> {
-    if table_hva_base % PAGE_SIZE != 0
+    if frame_pool_hva_base % PAGE_SIZE != 0
         || hva_to_pa_offset % PAGE_SIZE != 0
-        || hva_to_pa_offset > table_hva_base
-        || table_frame_count == 0
-        || table_frame_count > BIT_ALLOC_CAPACITY
+        || hva_to_pa_offset > frame_pool_hva_base
+        || frame_pool_frame_count == 0
+        || frame_pool_frame_count > BIT_ALLOC_CAPACITY
         || !(MIN_IPA_BITS..=MAX_IPA_BITS).contains(&ipa_bits)
     {
         return Err(Error::InvalidArgument);
     }
 
-    let table_bytes = table_frame_count
+    let frame_pool_bytes = frame_pool_frame_count
         .checked_mul(PAGE_SIZE)
         .ok_or(Error::InvalidArgument)?;
-    table_hva_base
-        .checked_add(table_bytes)
+    frame_pool_hva_base
+        .checked_add(frame_pool_bytes)
         .ok_or(Error::InvalidArgument)?;
-    table_hva_base
+    frame_pool_hva_base
         .checked_add(BIT_ALLOC_ADDRESS_SPAN)
         .ok_or(Error::InvalidArgument)?;
 
-    let table_pa_base = table_hva_base - hva_to_pa_offset;
-    let table_pa_end = table_pa_base
-        .checked_add(table_bytes)
+    let frame_pool_pa_base = frame_pool_hva_base - hva_to_pa_offset;
+    let frame_pool_pa_end = frame_pool_pa_base
+        .checked_add(frame_pool_bytes)
         .ok_or(Error::InvalidArgument)?;
-    if table_pa_end == 0 || table_pa_end - 1 > MAX_PA {
+    if frame_pool_pa_end == 0 || frame_pool_pa_end - 1 > MAX_PA {
         return Err(Error::InvalidArgument);
     }
     Ok(())
@@ -293,18 +411,18 @@ fn validate_pa_page(pa: usize) -> Result<(), Error> {
     Ok(())
 }
 
-/// Initialize the shared allocator from Jailhouse's reserved memory pool.
+/// Initialize the global frame allocator from its dedicated frame pool.
 /// The page-table create entry point performs the same initialization lazily,
 /// so Jailhouse may call this explicitly during paging setup or omit it.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn verihymem_jailhouse_mem_pool_init(
-    table_hva_base: usize,
-    table_frame_count: usize,
+pub unsafe extern "C" fn vj_global_frame_allocator_init(
+    frame_pool_hva_base: usize,
+    frame_pool_frame_count: usize,
     hva_to_pa_offset: usize,
 ) -> i32 {
-    if validate_mem_pool(
-        table_hva_base,
-        table_frame_count,
+    if validate_global_frame_pool(
+        frame_pool_hva_base,
+        frame_pool_frame_count,
         hva_to_pa_offset,
         MIN_IPA_BITS,
     )
@@ -312,7 +430,13 @@ pub unsafe extern "C" fn verihymem_jailhouse_mem_pool_init(
     {
         return Error::InvalidArgument as i32;
     }
-    match unsafe { init_global_allocator(table_hva_base, table_frame_count, hva_to_pa_offset) } {
+    match unsafe {
+        init_global_frame_allocator(
+            frame_pool_hva_base,
+            frame_pool_frame_count,
+            hva_to_pa_offset,
+        )
+    } {
         Ok(_) => 0,
         Err(err) => err as i32,
     }
@@ -320,38 +444,50 @@ pub unsafe extern "C" fn verihymem_jailhouse_mem_pool_init(
 
 /// Allocate and initialize one opaque VeriHyMem page-table instance.
 ///
-/// The memory pool remains owned by Jailhouse; this handle only records the
-/// allocator/page-table state that operates on it. A null return means that the
-/// supplied geometry is outside the first integration envelope.
+/// `out_handle` receives the opaque handle on success and is set to null on
+/// failure. The global frame pool is exclusively assigned by Jailhouse; this
+/// handle records only its page-table client state.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn verihymem_jailhouse_pt_create(
-    table_hva_base: usize,
-    table_frame_count: usize,
+pub unsafe extern "C" fn vj_pt_create(
+    frame_pool_hva_base: usize,
+    frame_pool_frame_count: usize,
     hva_to_pa_offset: usize,
     ipa_bits: u8,
-) -> *mut JailhousePageTable {
+    out_handle: *mut *mut JailhousePageTable,
+) -> i32 {
+    let Some(out_handle) = (unsafe { out_handle.as_mut() }) else {
+        return Error::InvalidArgument as i32;
+    };
+    *out_handle = core::ptr::null_mut();
+
     match unsafe {
         JailhousePageTable::new(
-            table_hva_base,
-            table_frame_count,
+            frame_pool_hva_base,
+            frame_pool_frame_count,
             hva_to_pa_offset,
             ipa_bits,
         )
     } {
-        Ok(table) => Box::into_raw(Box::new(table)),
-        Err(_) => core::ptr::null_mut(),
+        Ok(table) => {
+            *out_handle = Box::into_raw(Box::new(table));
+            0
+        }
+        Err(err) => err as i32,
     }
 }
 
 /// Map one 4 KiB page into an opaque page-table instance.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn verihymem_jailhouse_pt_map_page(
+pub unsafe extern "C" fn vj_pt_map_page(
     handle: *mut JailhousePageTable,
     ipa: usize,
     pa: usize,
-    attrs: MapAttrs,
+    attrs: CMapAttrs,
 ) -> i32 {
     let Some(table) = (unsafe { handle.as_mut() }) else {
+        return Error::InvalidArgument as i32;
+    };
+    let Ok(attrs) = MapAttrs::try_from(attrs) else {
         return Error::InvalidArgument as i32;
     };
     match table.map_page(ipa, pa, attrs) {
@@ -362,10 +498,7 @@ pub unsafe extern "C" fn verihymem_jailhouse_pt_map_page(
 
 /// Unmap one 4 KiB page from an opaque page-table instance.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn verihymem_jailhouse_pt_unmap_page(
-    handle: *mut JailhousePageTable,
-    ipa: usize,
-) -> i32 {
+pub unsafe extern "C" fn vj_pt_unmap_page(handle: *mut JailhousePageTable, ipa: usize) -> i32 {
     let Some(table) = (unsafe { handle.as_mut() }) else {
         return Error::InvalidArgument as i32;
     };
@@ -377,29 +510,57 @@ pub unsafe extern "C" fn verihymem_jailhouse_pt_unmap_page(
 
 /// Query one mapping. `out` must point to writable caller-owned storage.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn verihymem_jailhouse_pt_query(
+pub unsafe extern "C" fn vj_pt_query(
     handle: *const JailhousePageTable,
     ipa: usize,
-    out: *mut Mapping,
+    out: *mut CMapping,
 ) -> i32 {
     let (Some(table), Some(out)) = (unsafe { handle.as_ref() }, unsafe { out.as_mut() }) else {
         return Error::InvalidArgument as i32;
     };
     match table.query(ipa) {
         Ok(mapping) => {
-            *out = mapping;
+            *out = mapping.into();
             0
-        },
+        }
         Err(err) => err as i32,
     }
 }
 
-/// Destroy an empty page-table instance and release its table frames.
-/// Returns `Busy` if mappings remain or the handle is null.
+/// Return the page-table root physical address used by VTTBR_EL2.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn verihymem_jailhouse_pt_destroy(
-    handle: *mut JailhousePageTable,
+pub unsafe extern "C" fn vj_pt_root_pa(
+    handle: *const JailhousePageTable,
+    out_root_pa: *mut usize,
 ) -> i32 {
+    let (Some(table), Some(out_root_pa)) =
+        (unsafe { handle.as_ref() }, unsafe { out_root_pa.as_mut() })
+    else {
+        return Error::InvalidArgument as i32;
+    };
+    *out_root_pa = table.root_pa();
+    0
+}
+
+/// Return the number of 4 KiB mappings owned by this handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vj_pt_mapped_pages(
+    handle: *const JailhousePageTable,
+    out_mapped_pages: *mut usize,
+) -> i32 {
+    let (Some(table), Some(out_mapped_pages)) = (unsafe { handle.as_ref() }, unsafe {
+        out_mapped_pages.as_mut()
+    }) else {
+        return Error::InvalidArgument as i32;
+    };
+    *out_mapped_pages = table.mapped_pages();
+    0
+}
+
+/// Destroy an empty page-table instance and release its table frames.
+/// Returns `Busy` if mappings remain and leaves the original handle valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vj_pt_destroy(handle: *mut JailhousePageTable) -> i32 {
     if handle.is_null() {
         return Error::InvalidArgument as i32;
     }
@@ -407,18 +568,105 @@ pub unsafe extern "C" fn verihymem_jailhouse_pt_destroy(
     match table.destroy_empty() {
         Ok(()) => 0,
         Err(table) => {
-            core::mem::forget(table);
+            let restored_handle = Box::into_raw(table);
+            debug_assert_eq!(restored_handle, handle);
             Error::Busy as i32
-        },
+        }
     }
 }
 
 unsafe extern "C" {
-    fn verihymem_jailhouse_abort() -> !;
+    fn vj_abort() -> !;
 }
 
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    unsafe { verihymem_jailhouse_abort() }
+    unsafe { vj_abort() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::MaybeUninit;
+    use std::alloc::{Layout, alloc_zeroed};
+
+    #[test]
+    fn c_abi_page_table_lifecycle_and_busy_destroy() {
+        const FRAME_COUNT: usize = 64;
+        let layout = Layout::from_size_align(FRAME_COUNT * PAGE_SIZE, PAGE_SIZE).unwrap();
+        let frame_pool = unsafe { alloc_zeroed(layout) };
+        assert!(!frame_pool.is_null());
+
+        // GLOBAL_FRAME_ALLOCATOR retains this dedicated pool for process lifetime.
+        // Leaking it here models Jailhouse's static-lifetime frame-pool handoff.
+        let frame_pool_hva_base = frame_pool as usize;
+        let mut handle = core::ptr::null_mut();
+
+        assert_eq!(
+            unsafe {
+                vj_pt_create(
+                    frame_pool_hva_base,
+                    FRAME_COUNT,
+                    0,
+                    MIN_IPA_BITS,
+                    &mut handle,
+                )
+            },
+            0,
+        );
+        assert!(!handle.is_null());
+
+        let mut root_pa = 0;
+        assert_eq!(unsafe { vj_pt_root_pa(handle, &mut root_pa) }, 0);
+        assert!(root_pa >= frame_pool_hva_base);
+        assert!(root_pa < frame_pool_hva_base + FRAME_COUNT * PAGE_SIZE);
+        assert_eq!(root_pa % PAGE_SIZE, 0);
+
+        let invalid_attrs = CMapAttrs {
+            readable: 2,
+            writable: 1,
+            executable: 0,
+            device: 0,
+        };
+        assert_eq!(
+            unsafe { vj_pt_map_page(handle, 0x4000, 0x8000, invalid_attrs) },
+            Error::InvalidArgument as i32,
+        );
+
+        let attrs = CMapAttrs {
+            readable: 1,
+            writable: 1,
+            executable: 0,
+            device: 0,
+        };
+        assert_eq!(unsafe { vj_pt_map_page(handle, 0x4000, 0x8000, attrs) }, 0,);
+
+        let mut mapped_pages = 0;
+        assert_eq!(unsafe { vj_pt_mapped_pages(handle, &mut mapped_pages) }, 0,);
+        assert_eq!(mapped_pages, 1);
+
+        let mut mapping = MaybeUninit::<CMapping>::uninit();
+        assert_eq!(
+            unsafe { vj_pt_query(handle, 0x4000, mapping.as_mut_ptr()) },
+            0,
+        );
+        let mapping = unsafe { mapping.assume_init() };
+        assert_eq!(mapping.ipa_base, 0x4000);
+        assert_eq!(mapping.pa_base, 0x8000);
+        assert_eq!(mapping.size, PAGE_SIZE);
+        assert_eq!(mapping.attrs.readable, 1);
+        assert_eq!(mapping.attrs.writable, 1);
+
+        assert_eq!(unsafe { vj_pt_destroy(handle) }, Error::Busy as i32,);
+        let mut mapping_after_busy = MaybeUninit::<CMapping>::uninit();
+        assert_eq!(
+            unsafe { vj_pt_query(handle, 0x4000, mapping_after_busy.as_mut_ptr()) },
+            0,
+        );
+
+        // Busy destruction preserves the original handle, so it remains usable.
+        assert_eq!(unsafe { vj_pt_unmap_page(handle, 0x4000) }, 0);
+        assert_eq!(unsafe { vj_pt_destroy(handle) }, 0);
+    }
 }
