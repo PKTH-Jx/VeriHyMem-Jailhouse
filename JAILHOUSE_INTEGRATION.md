@@ -581,17 +581,23 @@ make run-integrated \
     CROSS_COMPILE=aarch64-linux-gnu-
 ```
 
-`run-integrated` always rebuilds and audits the integrated hypervisor, installs
-its artifacts in the integrated rootfs, atomically regenerates the disk image,
-and only then starts QEMU. This prevents a newly built `jailhouse.bin` from
-being followed by an accidental boot of an older image. Use `Ctrl-a x` to exit
-QEMU. The equivalent original-Jailhouse workflow is:
+`run-integrated` builds and audits the integrated hypervisor only when its
+inputs are stale, installs changed artifacts in the integrated rootfs, and
+atomically regenerates the disk image only when needed before starting QEMU.
+This prevents a newly built `jailhouse.bin` from being followed by an
+accidental boot of an older image while keeping repeated runs incremental. Use
+`Ctrl-a x` to exit QEMU. The equivalent original-Jailhouse workflow is:
 
 ```sh
 make run-original \
     KDIR=/absolute/path/to/linux-build \
     CROSS_COMPILE=aarch64-linux-gnu-
 ```
+
+The original workflow follows the same incremental dependency rules: it
+rebuilds Jailhouse, reinstalls artifacts, and regenerates the image only when
+their inputs are stale. Switching between original and integrated builds
+forces one clean rebuild because both modes share Jailhouse's output tree.
 
 The default filesystem outputs are:
 
@@ -609,10 +615,11 @@ into `ORIGINAL_ROOTFS_DIR`. It then copies that complete tree with `cp -a
 image therefore remain available for A/B testing and recovery.
 
 Image refresh uses a temporary file and an atomic rename, so a failed
-`mkfs.ext4` does not replace the last complete image. Each `original-image`,
-`integrated-image`, `run-original`, or `run-integrated` invocation refreshes
-the selected image. Override the output paths when a previous image should be
-retained as a named snapshot:
+`mkfs.ext4` does not replace the last complete image. Each
+`original-image`, `integrated-image`, `run-original`, or `run-integrated`
+invocation refreshes the selected image when its prerequisites are newer.
+Override the output paths when a previous image should be retained as a named
+snapshot:
 
 ```sh
 make integrated-image \
@@ -665,24 +672,30 @@ cannot silently replace the table currently protecting the root cell.
 3. Mirror supported 4 KiB regions from `arch_map_memory_region` and
    `arch_unmap_memory_region` into `vj_pt_map_page`/`vj_pt_unmap_page`. Expand
    regions page by page and translate Jailhouse flags into `vj_map_attrs`.
-4. After each operation, compare `vj_pt_query` with
-   `paging_virt2phys`. Log and fail cell creation on any PA, size, or permission
-   mismatch. Initially reject or skip subpage MMIO and explicitly account for
-   `COMM_REGION`, `ROOTSHARED`, `LOADABLE`, device memory, and huge-page policy.
+4. The shadow checkpoint compared `vj_pt_query` with `paging_virt2phys` for
+   every mapped page and completed a create/load/start/destroy QEMU lifecycle.
+   That comparison was test-only and is no longer part of production cell
+   creation. Subpage MMIO remains intentionally absent from the cell table.
 5. On cell destroy, unmap all mirrored pages, require the mapped-page count to
    reach zero, then call `vj_pt_destroy`.
 
 ### Activation checkpoint
 
-Only after complete create/load/start/destroy shadow runs should ARM use
-`vj_pt_root_pa` in `arm_paging_vcpu_init`. Before that switch, confirm the
-AArch64 stage-2 descriptor bits and VTCR geometry against Jailhouse, add the
-required cache clean/barriers and VMID TLB invalidation, and test every rollback
-path. Keep Jailhouse's original page table behind a build flag until the new
-path passes multicore and IOMMU/device tests.
+ARM64 now uses the VJ table when initializing a vCPU for a non-root cell. The
+handoff is in `arm_paging_vcpu_init`: `vj_paging_vcpu_init` cleans the dedicated
+VJ table pool, executes the required DSB/ISB barriers, programs VTCR_EL2 for
+the table's IPA width, programs VTTBR_EL2 with the cell VMID and cached root
+physical address, and performs a VMID-scoped stage-1/stage-2 TLB invalidation.
+Parking and the root cell continue to use Jailhouse's original structures.
 
-The current wrapper supports only 4 KiB mappings and models 44--48 IPA bits.
-Jailhouse's huge pages, subpage regions, executable/XN behavior, IOMMU tables,
-and exact VTCR-selected IPA width therefore need explicit decisions before a
-drop-in replacement. The trusted assumptions are recorded in
+The VJ table currently has a fixed 39-bit IPA geometry and 4 KiB mappings. The
+original Jailhouse table remains populated in parallel, which keeps rollback
+and shadow comparison available while multicore and IOMMU/device coverage is
+completed.
+
+The current wrapper supports only 4 KiB mappings. It can construct a 39-bit
+three-level table or a 44--48-bit four-level table; Jailhouse currently creates
+the three-level form for each non-root cell and caches its physical root.
+Jailhouse's huge pages, subpage regions, executable/XN behavior, and IOMMU
+tables remain outside the VJ replacement scope. The trusted assumptions are recorded in
 `PROOF_BOUNDARY.md`.

@@ -25,6 +25,7 @@ LD_LLD ?= $(RUST_LLD)
 
 TARGET_DIR ?= target
 ARCHIVE := $(TARGET_DIR)/$(RUST_TARGET)/release/libverihymem_jailhouse.a
+CARGO_BUILD_STAMP := $(TARGET_DIR)/$(RUST_TARGET)/release/.verihymem-build
 JAILHOUSE_OBJ_DIR := $(TARGET_DIR)/jailhouse
 JAILHOUSE_RUST_OBJ := $(JAILHOUSE_OBJ_DIR)/vj-rust.o
 JAILHOUSE_DIR ?= jailhouse
@@ -51,6 +52,17 @@ INTEGRATED_DISK_IMAGE ?= $(FS_DIR)/LinuxInstallation-verihymem.img
 ROOTFS_STAMP := $(ORIGINAL_ROOTFS_DIR)/.verihymem-jailhouse-rootfs
 ORIGINAL_ARTIFACTS_STAMP := $(ORIGINAL_ROOTFS_DIR)/.jailhouse-original-artifacts
 INTEGRATED_ROOTFS_STAMP := $(INTEGRATED_ROOTFS_DIR)/.jailhouse-verihymem-artifacts
+INTEGRATED_ROOTFS_COPY_STAMP := $(INTEGRATED_ROOTFS_DIR)/.jailhouse-verihymem-rootfs
+ORIGINAL_BUILD_STAMP := $(JAILHOUSE_OBJ_DIR)/.jailhouse-original
+JAILHOUSE_BUILD_STAMP := $(JAILHOUSE_OBJ_DIR)/.jailhouse-integrated
+ORIGINAL_MODE_STAMP := $(JAILHOUSE_OBJ_DIR)/.jailhouse-original-mode
+INTEGRATED_MODE_STAMP := $(JAILHOUSE_OBJ_DIR)/.jailhouse-integrated-mode
+
+# Keep the artifact targets sensitive to source changes while allowing normal
+# repeated invocations to use Cargo and Jailhouse's own incremental outputs.
+VJ_SOURCE_FILES := $(shell git ls-files -- Cargo.toml Cargo.lock Makefile src include) \
+	$(addprefix verified-hv-mem/,$(shell git -C verified-hv-mem ls-files -- Cargo.toml Cargo.lock src))
+JAILHOUSE_SOURCE_FILES := $(addprefix $(JAILHOUSE_DIR)/,$(shell git -C $(JAILHOUSE_DIR) ls-files))
 ROOTFS_SUITE ?= jammy
 ROOTFS_MIRROR ?= http://ports.ubuntu.com/ubuntu-ports/
 ROOTFS_PACKAGES ?= systemd-sysv udev kmod iproute2
@@ -95,10 +107,10 @@ help:
 	@echo "  make jailhouse-original Build original ARM64 Jailhouse (requires KDIR)"
 	@echo "  make verihymem          Build the freestanding VeriHyMem wrapper archive"
 	@echo "  make jailhouse-integrated Build, link, and audit Jailhouse + VeriHyMem"
-	@echo "  make original-image     Rebuild original Jailhouse and refresh its image"
-	@echo "  make integrated-image   Rebuild integrated Jailhouse and refresh its image"
-	@echo "  make run-original       Refresh the original image and launch QEMU"
-	@echo "  make run-integrated     Refresh the integrated image and launch QEMU"
+	@echo "  make original-image     Build and refresh the original image when stale"
+	@echo "  make integrated-image   Build and refresh the integrated image when stale"
+	@echo "  make run-original       Refresh when stale, then launch the original image"
+	@echo "  make run-integrated     Refresh when stale, then launch the integrated image"
 	@echo "  make verify             Verify verified-hv-mem with Verus"
 	@echo "  make test               Run Rust unit tests and validate the C header"
 	@echo "  make check              Run compile, verify, and test"
@@ -114,12 +126,15 @@ check: compile verify test
 install-target:
 	$(RUSTUP) target add $(RUST_TARGET)
 
-compile:
+$(CARGO_BUILD_STAMP): $(VJ_SOURCE_FILES)
 	@$(RUSTUP) target list --installed | $(GREP) -qx '$(RUST_TARGET)' || \
 		{ echo "missing Rust target $(RUST_TARGET); run 'make install-target'" >&2; exit 1; }
 	RUSTFLAGS="$(RUSTFLAGS_FREESTANDING)" \
 		$(CARGO) build --locked --release --target $(RUST_TARGET)
 	@test -f $(ARCHIVE)
+	@touch "$@"
+
+compile: $(CARGO_BUILD_STAMP)
 
 verihymem: compile
 
@@ -175,7 +190,7 @@ rootfs: $(ROOTFS_STAMP)
 $(JAILHOUSE_OBJ_DIR):
 	mkdir -p $@
 
-$(JAILHOUSE_RUST_OBJ): compile | $(JAILHOUSE_OBJ_DIR)
+$(JAILHOUSE_RUST_OBJ): $(CARGO_BUILD_STAMP) | $(JAILHOUSE_OBJ_DIR)
 	$(LD_LLD) -r --gc-sections \
 		$(foreach symbol,$(VJ_ENTRY_POINTS),--undefined=$(symbol)) \
 		-o $@ $(ARCHIVE)
@@ -232,21 +247,55 @@ jailhouse-clean: jailhouse-check-env
 		CROSS_COMPILE=$(CROSS_COMPILE) \
 		KDIR=$(abspath $(KDIR)) \
 		VJ_DIR=
+	rm -f "$(ORIGINAL_MODE_STAMP)" "$(INTEGRATED_MODE_STAMP)" \
+		"$(ORIGINAL_BUILD_STAMP)" "$(JAILHOUSE_BUILD_STAMP)"
 
-jailhouse-original: jailhouse-clean
+# Build stamps retain source validity across mode switches. The mutually
+# exclusive mode stamps describe which build currently occupies jailhouse/.
+$(ORIGINAL_MODE_STAMP): $(ORIGINAL_BUILD_STAMP) | $(JAILHOUSE_OBJ_DIR)
+	@if test ! -f "$@"; then \
+		$(MAKE) -B "$(ORIGINAL_BUILD_STAMP)"; \
+	fi
+
+$(INTEGRATED_MODE_STAMP): $(JAILHOUSE_BUILD_STAMP) | $(JAILHOUSE_OBJ_DIR)
+	@if test ! -f "$@"; then \
+		$(MAKE) -B "$(JAILHOUSE_BUILD_STAMP)"; \
+	fi
+
+$(ORIGINAL_BUILD_STAMP): $(JAILHOUSE_SOURCE_FILES) Makefile | jailhouse-check-env
+	+$(JAILHOUSE_MAKE) -C $(JAILHOUSE_DIR) clean \
+		ARCH=$(JAILHOUSE_ARCH) \
+		CROSS_COMPILE=$(CROSS_COMPILE) \
+		KDIR=$(abspath $(KDIR)) \
+		VJ_DIR=
 	$(JAILHOUSE_MAKE) -C $(JAILHOUSE_DIR) modules \
 		ARCH=$(JAILHOUSE_ARCH) \
 		CROSS_COMPILE=$(CROSS_COMPILE) \
 		KDIR=$(abspath $(KDIR)) \
 		VJ_DIR=
+	@rm -f "$(INTEGRATED_MODE_STAMP)"
+	@touch "$(ORIGINAL_MODE_STAMP)" "$@"
 
-jailhouse-build: jailhouse-object jailhouse-clean
+jailhouse-original: $(ORIGINAL_MODE_STAMP)
+
+
+$(JAILHOUSE_BUILD_STAMP): $(JAILHOUSE_SOURCE_FILES) $(VJ_SOURCE_FILES) \
+		$(JAILHOUSE_RUST_OBJ) | jailhouse-check-env
+	+$(JAILHOUSE_MAKE) -C $(JAILHOUSE_DIR) clean \
+		ARCH=$(JAILHOUSE_ARCH) \
+		CROSS_COMPILE=$(CROSS_COMPILE) \
+		KDIR=$(abspath $(KDIR)) \
+		VJ_DIR=
 	$(JAILHOUSE_MAKE) -C $(JAILHOUSE_DIR) modules \
 		ARCH=$(JAILHOUSE_ARCH) \
 		CROSS_COMPILE=$(CROSS_COMPILE) \
 		KDIR=$(abspath $(KDIR)) \
 		VJ_DIR=$(CURDIR) \
 		VJ_FRAME_POOL_PAGES=$(VJ_FRAME_POOL_PAGES)
+	@rm -f "$(ORIGINAL_MODE_STAMP)"
+	@touch "$(INTEGRATED_MODE_STAMP)" "$@"
+
+jailhouse-build: $(INTEGRATED_MODE_STAMP)
 
 jailhouse-audit: jailhouse-build
 	@test -f $(JAILHOUSE_HYPERVISOR_OBJ) || \
@@ -324,37 +373,42 @@ install-jailhouse-artifacts:
 	$(SUDO) install -Dm755 "$(JAILHOUSE_INMATE_BIN)" \
 		"$(DEST_ROOTFS)/root/jailhouse/gic-demo.bin"
 
-refresh-original-rootfs: rootfs
+$(ORIGINAL_ARTIFACTS_STAMP): $(ROOTFS_STAMP) $(ORIGINAL_BUILD_STAMP)
 	+$(MAKE) jailhouse-original
 	+$(MAKE) install-jailhouse-artifacts DEST_ROOTFS="$(ORIGINAL_ROOTFS_DIR)"
 	$(SUDO) touch "$(ORIGINAL_ARTIFACTS_STAMP)"
 	@echo "installed original Jailhouse artifacts in $(ORIGINAL_ROOTFS_DIR)"
 
-$(ORIGINAL_ARTIFACTS_STAMP): $(ROOTFS_STAMP)
-	+$(MAKE) refresh-original-rootfs
+refresh-original-rootfs: $(ORIGINAL_ARTIFACTS_STAMP)
 
-original-rootfs: refresh-original-rootfs
+original-rootfs: $(ORIGINAL_ARTIFACTS_STAMP)
 
-$(INTEGRATED_ROOTFS_STAMP): $(ORIGINAL_ARTIFACTS_STAMP)
+$(INTEGRATED_ROOTFS_COPY_STAMP): $(ORIGINAL_ARTIFACTS_STAMP)
 	@test "$(abspath $(INTEGRATED_ROOTFS_DIR))" != \
 		"$(abspath $(ORIGINAL_ROOTFS_DIR))" || \
 		{ echo "original and integrated rootfs paths must differ" >&2; exit 1; }
-	@test ! -e "$(INTEGRATED_ROOTFS_DIR)" || { \
-		echo "refusing to overwrite integrated rootfs: $(INTEGRATED_ROOTFS_DIR)" >&2; \
-		exit 1; \
-	}
-	$(SUDO) cp -a --reflink=auto \
-		"$(ORIGINAL_ROOTFS_DIR)" "$(INTEGRATED_ROOTFS_DIR)"
+	@if test -f "$(INTEGRATED_ROOTFS_DIR)/var/lib/dpkg/status"; then \
+		echo "using existing integrated rootfs tree: $(INTEGRATED_ROOTFS_DIR)"; \
+	else \
+		test ! -e "$(INTEGRATED_ROOTFS_DIR)" || { \
+			echo "refusing non-rootfs path: $(INTEGRATED_ROOTFS_DIR)" >&2; \
+			exit 1; \
+		}; \
+		$(SUDO) cp -a --reflink=auto \
+			"$(ORIGINAL_ROOTFS_DIR)" "$(INTEGRATED_ROOTFS_DIR)"; \
+	fi
 	$(SUDO) touch "$@"
 	@echo "copied original rootfs to $(INTEGRATED_ROOTFS_DIR)"
 
-integrated-rootfs: $(INTEGRATED_ROOTFS_STAMP)
+$(INTEGRATED_ROOTFS_STAMP): $(INTEGRATED_ROOTFS_COPY_STAMP) $(JAILHOUSE_BUILD_STAMP)
 	+$(MAKE) jailhouse-integrated
 	+$(MAKE) install-jailhouse-artifacts DEST_ROOTFS="$(INTEGRATED_ROOTFS_DIR)"
 	$(SUDO) touch "$(INTEGRATED_ROOTFS_STAMP)"
 	@echo "installed integrated Jailhouse artifacts in $(INTEGRATED_ROOTFS_DIR)"
 
-original-image: original-rootfs
+integrated-rootfs: $(INTEGRATED_ROOTFS_STAMP)
+
+$(ORIGINAL_DISK_IMAGE): $(ORIGINAL_ARTIFACTS_STAMP)
 	@mkdir -p "$(dir $(ORIGINAL_DISK_IMAGE))"
 	@set -e; tmp="$(ORIGINAL_DISK_IMAGE).tmp"; \
 		test ! -e "$$tmp" || { echo "stale temporary image: $$tmp" >&2; exit 1; }; \
@@ -366,7 +420,9 @@ original-image: original-rootfs
 		trap - EXIT HUP INT TERM
 	@echo "refreshed original image: $(ORIGINAL_DISK_IMAGE)"
 
-integrated-image: integrated-rootfs
+original-image: $(ORIGINAL_DISK_IMAGE)
+
+$(INTEGRATED_DISK_IMAGE): $(INTEGRATED_ROOTFS_STAMP)
 	@mkdir -p "$(dir $(INTEGRATED_DISK_IMAGE))"
 	@set -e; tmp="$(INTEGRATED_DISK_IMAGE).tmp"; \
 		test ! -e "$$tmp" || { echo "stale temporary image: $$tmp" >&2; exit 1; }; \
@@ -377,6 +433,8 @@ integrated-image: integrated-rootfs
 		mv -f "$$tmp" "$(INTEGRATED_DISK_IMAGE)"; \
 		trap - EXIT HUP INT TERM
 	@echo "refreshed integrated image: $(INTEGRATED_DISK_IMAGE)"
+
+integrated-image: $(INTEGRATED_DISK_IMAGE)
 
 qemu-check:
 	@command -v "$(QEMU)" >/dev/null 2>&1 || \
