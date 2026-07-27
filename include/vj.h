@@ -4,6 +4,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct cell;
+struct jailhouse_memory;
+
+/* Jailhouse integration entry points implemented by hypervisor/vj.c. */
+int vj_paging_init(void);
+int vj_cell_init(struct cell *cell);
+int vj_cell_map_memory_region(struct cell *cell,
+			      const struct jailhouse_memory *mem,
+			      uintptr_t phys_start);
+int vj_cell_unmap_memory_region(struct cell *cell,
+				const struct jailhouse_memory *mem);
+int vj_cell_destroy(struct cell *cell);
+
 /*
  * The frame pool is dedicated to VeriHyMem's GlobalFrameAllocator and must not
  * overlap JailhouseHeapAllocator storage. Pool exhaustion is outside the

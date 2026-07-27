@@ -19,7 +19,7 @@ use core::ptr;
 use spin::Once;
 use verified_hv_mem::address::addr::{PAddr, VAddr};
 use verified_hv_mem::address::frame::{Frame, FrameSize, MemAttr};
-use verified_hv_mem::bitmap_allocator::bitmap_impl::BitAlloc1M;
+use verified_hv_mem::bitmap_allocator::bitmap_impl::BitAlloc256;
 use verified_hv_mem::global_allocator::GlobalAllocator;
 use verified_hv_mem::page_table::pt_arch::{PTArch, PTArchLevel};
 use verified_hv_mem::page_table::{Aarch64PTE, ExPageTable, PTConstants, PageTable};
@@ -30,7 +30,7 @@ pub const MIN_IPA_BITS: u8 = 44;
 pub const MAX_IPA_BITS: u8 = 48;
 pub const MAX_PA: usize = (1usize << MAX_IPA_BITS) - 1;
 
-const BIT_ALLOC_CAPACITY: usize = 1 << 20;
+const BIT_ALLOC_CAPACITY: usize = 1 << 8;
 const BIT_ALLOC_ADDRESS_SPAN: usize = BIT_ALLOC_CAPACITY * PAGE_SIZE;
 
 #[derive(Clone, Copy)]
@@ -43,12 +43,17 @@ struct GlobalFramePoolConfig {
 /// VeriHyMem's verified global frame allocator specialization.
 ///
 /// This is distinct from the Rust global heap allocator in `heap.rs`.
-pub type GlobalFrameAllocator = GlobalAllocator<BitAlloc1M>;
+pub type GlobalFrameAllocator = GlobalAllocator<BitAlloc256>;
 
+// Jailhouse's bootstrap mapping reaches initialized data before the final
+// hypervisor mappings are installed. Keep these early-init singletons there
+// instead of allowing zero initialization to place them at the end of .bss.
+#[cfg_attr(not(test), unsafe(link_section = ".data"))]
 static GLOBAL_FRAME_POOL_CONFIG: Once<GlobalFramePoolConfig> = Once::new();
+#[cfg_attr(not(test), unsafe(link_section = ".data"))]
 static GLOBAL_FRAME_ALLOCATOR: Once<GlobalFrameAllocator> = Once::new();
 
-pub type ConcretePageTable = ExPageTable<BitAlloc1M, Aarch64PTE>;
+pub type ConcretePageTable = ExPageTable<BitAlloc256, Aarch64PTE>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
