@@ -22,8 +22,14 @@ The current prototype assumes all of the following:
 5. **Fixed HVA/PA direct map.** For every frame-pool address, subtracting `hva_to_pa_offset` yields the PA used in page-table entries and the root register, and adding it back yields the dereferenceable HVA. The conversion does not overflow and matches Jailhouse's `page_offset` mapping.
 6. **Valid C calls.** Jailhouse passes live, correctly aligned output pointers and opaque handles returned by `pt_create`; it does not forge, alias, reuse, or access a handle after successful destruction. Calls that mutate one handle are externally serialized.
 7. **Admitted mappings.** Jailhouse supplies page-aligned IPAs and PAs in the configured address width and assigns those mapped data frames to the target cell according to Jailhouse's own lifecycle rules. The raw page-table layer does not prove ownership of mapped data frames.
-8. **Matching architecture.** The active hardware configuration uses the AArch64 four-level, 4 KiB stage-2 layout and descriptor interpretation represented by `PTArch` and `Aarch64PTE`.
-9. **Hardware maintenance outside this layer.** Before a generated table is activated, Jailhouse provides the required page-table cache maintenance, barriers, target-VMID TLB invalidation, VTTBR programming, and CPU synchronization. The current wrapper does not establish these effects.
+8. **Matching architecture.** The active VJ configuration uses the AArch64
+   three-level, 4 KiB stage-2 layout and descriptor interpretation represented
+   by `PTArch` and `Aarch64PTE`.
+9. **Hardware activation.** Before a generated table is activated, the ARM64
+   Jailhouse integration cleans the VJ-owned table pool, applies the required
+   barriers, programs VTCR_EL2/VTTBR_EL2, and invalidates the current VMID's
+   stage-1/stage-2 translations. Correct CPU and IOMMU behavior remains outside
+   the VeriHyMem proof.
 10. **Abort semantics.** A Rust panic or violated infallibility assumption ends in `vj_abort`; recovery after an abort is not modeled.
 
 ## Conditional properties established

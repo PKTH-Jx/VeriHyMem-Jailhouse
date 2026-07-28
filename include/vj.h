@@ -7,6 +7,15 @@
 struct cell;
 struct jailhouse_memory;
 
+#define VJ_SHADOW_IPA_BITS 39
+
+/* VJ's counterpart to Jailhouse's struct paging_structures. */
+struct vj_paging_structures {
+	void *root_table;
+	uintptr_t root_table_pa;
+	uint8_t ipa_bits;
+};
+
 /* Jailhouse integration entry points implemented by hypervisor/vj.c. */
 int vj_paging_init(void);
 int vj_cell_init(struct cell *cell);
@@ -16,6 +25,9 @@ int vj_cell_map_memory_region(struct cell *cell,
 int vj_cell_unmap_memory_region(struct cell *cell,
 				const struct jailhouse_memory *mem);
 int vj_cell_destroy(struct cell *cell);
+
+/* Install a VJ stage-2 table on the current CPU. */
+void vj_paging_vcpu_init(const struct vj_paging_structures *pg_structs);
 
 /*
  * The frame pool is dedicated to VeriHyMem's GlobalFrameAllocator and must not

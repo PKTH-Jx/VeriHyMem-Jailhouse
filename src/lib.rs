@@ -26,7 +26,8 @@ use verified_hv_mem::page_table::{Aarch64PTE, ExPageTable, PTConstants, PageTabl
 use vstd::prelude::Tracked;
 
 pub const PAGE_SIZE: usize = 0x1000;
-pub const MIN_IPA_BITS: u8 = 44;
+pub const THREE_LEVEL_IPA_BITS: u8 = 39;
+pub const FOUR_LEVEL_MIN_IPA_BITS: u8 = 44;
 pub const MAX_IPA_BITS: u8 = 48;
 pub const MAX_PA: usize = (1usize << MAX_IPA_BITS) - 1;
 
@@ -219,7 +220,7 @@ pub struct JailhousePageTable {
 }
 
 impl JailhousePageTable {
-    /// Construct an empty four-level AArch64 stage-2 page table.
+    /// Construct an empty AArch64 stage-2 page table.
     ///
     /// # Safety
     ///
@@ -247,11 +248,14 @@ impl JailhousePageTable {
             )?
         };
 
-        let arch = PTArch(vec![
-            PTArchLevel {
+        let mut levels = vec![];
+        if ipa_bits >= FOUR_LEVEL_MIN_IPA_BITS {
+            levels.push(PTArchLevel {
                 entry_count: 512,
                 frame_size: FrameSize::Size512G,
-            },
+            });
+        }
+        levels.extend([
             PTArchLevel {
                 entry_count: 512,
                 frame_size: FrameSize::Size1G,
@@ -265,6 +269,7 @@ impl JailhousePageTable {
                 frame_size: FrameSize::Size4K,
             },
         ]);
+        let arch = PTArch(levels);
         let constants = PTConstants {
             arch,
             hva_to_pa_offset,
@@ -288,7 +293,7 @@ impl JailhousePageTable {
 
     /// Physical address to install in the stage-2 root register.
     pub fn root_pa(&self) -> usize {
-        self.page_table.0.pt_mem.root.0
+        self.page_table.root().0
     }
 
     pub fn map_page(&mut self, ipa: usize, pa: usize, attrs: MapAttrs) -> Result<(), Error> {
@@ -384,7 +389,8 @@ fn validate_global_frame_pool(
         || hva_to_pa_offset > frame_pool_hva_base
         || frame_pool_frame_count == 0
         || frame_pool_frame_count > BIT_ALLOC_CAPACITY
-        || !(MIN_IPA_BITS..=MAX_IPA_BITS).contains(&ipa_bits)
+        || !(ipa_bits == THREE_LEVEL_IPA_BITS
+            || (FOUR_LEVEL_MIN_IPA_BITS..=MAX_IPA_BITS).contains(&ipa_bits))
     {
         return Err(Error::InvalidArgument);
     }
@@ -429,7 +435,7 @@ pub unsafe extern "C" fn vj_global_frame_allocator_init(
         frame_pool_hva_base,
         frame_pool_frame_count,
         hva_to_pa_offset,
-        MIN_IPA_BITS,
+        THREE_LEVEL_IPA_BITS,
     )
     .is_err()
     {
@@ -614,13 +620,30 @@ mod tests {
                     frame_pool_hva_base,
                     FRAME_COUNT,
                     0,
-                    MIN_IPA_BITS,
+                    THREE_LEVEL_IPA_BITS,
                     &mut handle,
                 )
             },
             0,
         );
         assert!(!handle.is_null());
+
+        assert_eq!(
+            unsafe {
+                vj_pt_map_page(
+                    handle,
+                    1usize << THREE_LEVEL_IPA_BITS,
+                    0x8000,
+                    CMapAttrs {
+                        readable: 1,
+                        writable: 1,
+                        executable: 0,
+                        device: 0,
+                    },
+                )
+            },
+            Error::InvalidArgument as i32,
+        );
 
         let mut root_pa = 0;
         assert_eq!(unsafe { vj_pt_root_pa(handle, &mut root_pa) }, 0);
