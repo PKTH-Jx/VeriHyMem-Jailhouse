@@ -1,0 +1,6 @@
+[submodule "jailhouse"]
+	path = jailhouse
+	url = https://github.com/PKTH-Jx/jailhouse.git
+[submodule "verified-hv-mem"]
+	path = verified-hv-mem
+	url = https://github.com/LiuJun5817/verified-hv-mem.git
