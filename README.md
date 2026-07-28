@@ -2,7 +2,7 @@
 
 `verihymem-jailhouse` is the `no_std` executable adapter between Jailhouse and VeriHyMem. It builds as both an `rlib` and a `staticlib`; Jailhouse will consume the static archive in its final hypervisor link.
 
-The first implementation owns concrete `ExPageTable<BitAlloc1M, Aarch64PTE>` instances backed by one dedicated HVA frame pool supplied by Jailhouse. `GlobalFrameAllocator`, the local name for `GlobalAllocator<BitAlloc1M>`, is initialized once in a `spin::Once`; each page-table handle registers an allocator client and the verified allocator maintains client-disjoint frame ownership. The first initialization receives the frame-pool HVA and Jailhouse's `page_offset`, zeros the pool, and keeps every page-table/PTE/root address in PA.
+The integration owns concrete `ExPageTable<BitAlloc4K, Aarch64PTE>` instances backed by one dedicated HVA frame pool supplied by Jailhouse. `GlobalFrameAllocator`, the local name for `GlobalAllocator<BitAlloc4K>`, is initialized once in a `spin::Once`; each page-table handle registers an allocator client and the verified allocator maintains client-disjoint frame ownership. The first initialization receives the frame-pool HVA and Jailhouse's `page_offset`, zeros the pool, and keeps every page-table/PTE/root address in PA. The integrated build reserves the allocator's full capacity of 4096 frames (16 MiB) by default.
 
 The Rust heap is independent: `JailhouseHeapAllocator` uses Jailhouse-provided heap hooks only for executable Rust metadata such as `Box` and `Vec`; it is not a client of `GlobalFrameAllocator`.
 
@@ -15,10 +15,16 @@ and the security properties left for future work.
 The library exposes the page-table operations through the opaque C ABI in
 `include/vj.h`: global frame allocator initialization,
 page-table create/map/unmap/query/root/destroy, and the independent heap and
-abort hooks. Jailhouse builds a 39-bit, three-level table for each non-root
-cell and caches its physical root while keeping the original page table active.
-The query APIs remain available for tests, but production cell creation no
-longer performs shadow validation.
+abort hooks. Jailhouse builds a 39-bit, three-level VeriHyMem CPU table for
+every cell, including the root cell, and a separate VeriHyMem IOMMU table for
+cells with assigned stream IDs on an SMMUv3 system. Cells no longer allocate
+or populate Jailhouse's original stage-2 CPU page table: its native root and
+geometry pointers remain null, and compile-time branches route all cell
+create/map/unmap/query/destroy and vCPU activation operations directly to
+VeriHyMem. SMMUv3 consumes the separate DMA-only VeriHyMem IOMMU root;
+integrated builds reject SMMUv2/MMU-500 and PVU configurations. Jailhouse's
+EL2, temporary-mapping, and CPU-parking tables stay native. The experimental
+runtime target is QEMU `virt` with GICv3 and SMMUv3.
 
 See [JAILHOUSE_INTEGRATION.md](JAILHOUSE_INTEGRATION.md) for the
 dependency inventory, original and integrated builds, QEMU/target run procedure,

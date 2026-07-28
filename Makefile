@@ -78,7 +78,7 @@ QEMU_RAM ?= 1G
 LINUX_RAM ?= 768M
 QEMU_APPEND ?= root=/dev/vda rw rootwait console=ttyAMA0 mem=$(LINUX_RAM)
 QEMU_EXTRA_ARGS ?=
-VJ_FRAME_POOL_PAGES ?= 128
+VJ_FRAME_POOL_PAGES ?= 4096
 
 VJ_ENTRY_POINTS := \
 	vj_global_frame_allocator_init \

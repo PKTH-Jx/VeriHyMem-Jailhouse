@@ -19,7 +19,7 @@ use core::ptr;
 use spin::Once;
 use verified_hv_mem::address::addr::{PAddr, VAddr};
 use verified_hv_mem::address::frame::{Frame, FrameSize, MemAttr};
-use verified_hv_mem::bitmap_allocator::bitmap_impl::BitAlloc256;
+use verified_hv_mem::bitmap_allocator::bitmap_impl::BitAlloc4K;
 use verified_hv_mem::global_allocator::GlobalAllocator;
 use verified_hv_mem::page_table::pt_arch::{PTArch, PTArchLevel};
 use verified_hv_mem::page_table::{Aarch64PTE, ExPageTable, PTConstants, PageTable};
@@ -31,7 +31,7 @@ pub const FOUR_LEVEL_MIN_IPA_BITS: u8 = 44;
 pub const MAX_IPA_BITS: u8 = 48;
 pub const MAX_PA: usize = (1usize << MAX_IPA_BITS) - 1;
 
-const BIT_ALLOC_CAPACITY: usize = 1 << 8;
+const BIT_ALLOC_CAPACITY: usize = 1 << 12;
 const BIT_ALLOC_ADDRESS_SPAN: usize = BIT_ALLOC_CAPACITY * PAGE_SIZE;
 
 #[derive(Clone, Copy)]
@@ -44,7 +44,7 @@ struct GlobalFramePoolConfig {
 /// VeriHyMem's verified global frame allocator specialization.
 ///
 /// This is distinct from the Rust global heap allocator in `heap.rs`.
-pub type GlobalFrameAllocator = GlobalAllocator<BitAlloc256>;
+pub type GlobalFrameAllocator = GlobalAllocator<BitAlloc4K>;
 
 // Jailhouse's bootstrap mapping reaches initialized data before the final
 // hypervisor mappings are installed. Keep these early-init singletons there
@@ -54,7 +54,7 @@ static GLOBAL_FRAME_POOL_CONFIG: Once<GlobalFramePoolConfig> = Once::new();
 #[cfg_attr(not(test), unsafe(link_section = ".data"))]
 static GLOBAL_FRAME_ALLOCATOR: Once<GlobalFrameAllocator> = Once::new();
 
-pub type ConcretePageTable = ExPageTable<BitAlloc256, Aarch64PTE>;
+pub type ConcretePageTable = ExPageTable<BitAlloc4K, Aarch64PTE>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
@@ -604,7 +604,11 @@ mod tests {
 
     #[test]
     fn c_abi_page_table_lifecycle_and_busy_destroy() {
-        const FRAME_COUNT: usize = 64;
+        const FRAME_COUNT: usize = BIT_ALLOC_CAPACITY;
+        assert_eq!(
+            validate_global_frame_pool(0x1000_0000, 2048, 0, THREE_LEVEL_IPA_BITS),
+            Ok(())
+        );
         let layout = Layout::from_size_align(FRAME_COUNT * PAGE_SIZE, PAGE_SIZE).unwrap();
         let frame_pool = unsafe { alloc_zeroed(layout) };
         assert!(!frame_pool.is_null());
@@ -613,6 +617,7 @@ mod tests {
         // Leaking it here models Jailhouse's static-lifetime frame-pool handoff.
         let frame_pool_hva_base = frame_pool as usize;
         let mut handle = core::ptr::null_mut();
+        let mut iommu_handle = core::ptr::null_mut();
 
         assert_eq!(
             unsafe {
@@ -627,6 +632,20 @@ mod tests {
             0,
         );
         assert!(!handle.is_null());
+
+        assert_eq!(
+            unsafe {
+                vj_pt_create(
+                    frame_pool_hva_base,
+                    FRAME_COUNT,
+                    0,
+                    THREE_LEVEL_IPA_BITS,
+                    &mut iommu_handle,
+                )
+            },
+            0,
+        );
+        assert!(!iommu_handle.is_null());
 
         assert_eq!(
             unsafe {
@@ -650,6 +669,9 @@ mod tests {
         assert!(root_pa >= frame_pool_hva_base);
         assert!(root_pa < frame_pool_hva_base + FRAME_COUNT * PAGE_SIZE);
         assert_eq!(root_pa % PAGE_SIZE, 0);
+        let mut iommu_root_pa = 0;
+        assert_eq!(unsafe { vj_pt_root_pa(iommu_handle, &mut iommu_root_pa) }, 0);
+        assert_ne!(root_pa, iommu_root_pa);
 
         let invalid_attrs = CMapAttrs {
             readable: 2,
@@ -669,6 +691,10 @@ mod tests {
             device: 0,
         };
         assert_eq!(unsafe { vj_pt_map_page(handle, 0x4000, 0x8000, attrs) }, 0,);
+        assert_eq!(
+            unsafe { vj_pt_map_page(iommu_handle, 0x4000, 0xc000, attrs) },
+            0,
+        );
 
         let mut mapped_pages = 0;
         assert_eq!(unsafe { vj_pt_mapped_pages(handle, &mut mapped_pages) }, 0,);
@@ -696,5 +722,7 @@ mod tests {
         // Busy destruction preserves the original handle, so it remains usable.
         assert_eq!(unsafe { vj_pt_unmap_page(handle, 0x4000) }, 0);
         assert_eq!(unsafe { vj_pt_destroy(handle) }, 0);
+        assert_eq!(unsafe { vj_pt_unmap_page(iommu_handle, 0x4000) }, 0);
+        assert_eq!(unsafe { vj_pt_destroy(iommu_handle) }, 0);
     }
 }

@@ -1,12 +1,12 @@
 # VeriHyMem-Jailhouse Prototype Proof Boundary
 
-This document states the proof boundary for the full-drop-in prototype. The VeriHyMem components retain their machine-checked proofs, but this wrapper and the Jailhouse C code are not verified with Verus. Consequently, the properties below are conditional on the Jailhouse integration assumptions; they are not an end-to-end theorem about the complete Jailhouse binary.
+This document states the proof boundary for the QEMU GICv3/SMMUv3 integration prototype. The VeriHyMem components retain their machine-checked proofs, but this wrapper and the Jailhouse C code are not verified with Verus. Consequently, the properties below are conditional on the Jailhouse integration assumptions; they are not an end-to-end theorem about the complete Jailhouse binary. SMMUv2/MMU-500 and PVU configurations are rejected by integrated builds.
 
 ## Two independent allocators
 
 The integration deliberately has two allocators with different roles:
 
-- `GlobalFrameAllocator` is VeriHyMem's `GlobalAllocator<BitAlloc1M>`. It allocates 4 KiB page-table frames from one dedicated frame pool supplied by Jailhouse. VeriHyMem proves that registered allocator clients own disjoint frame sets.
+- `GlobalFrameAllocator` is VeriHyMem's `GlobalAllocator<BitAlloc4K>`. It allocates 4 KiB page-table frames from one dedicated frame pool supplied by Jailhouse. VeriHyMem proves that registered allocator clients own disjoint frame sets. CPU and SMMUv3 IOMMU tables are separate clients; the integrated build reserves the allocator's full capacity of 4096 frames by default.
 - `JailhouseHeapAllocator` is Rust's global heap allocator. It obtains storage for executable metadata such as `Box<JailhousePageTable>` and the `Vec` used by `PTArch` through the unverified `vj_heap_alloc` and `vj_heap_dealloc` hooks.
 
 The heap is not a client of `GlobalFrameAllocator`, and heap allocations are not covered by the allocator's client-disjointness proof.
@@ -26,7 +26,8 @@ The current prototype assumes all of the following:
    three-level, 4 KiB stage-2 layout and descriptor interpretation represented
    by `PTArch` and `Aarch64PTE`.
 9. **Hardware activation.** Before a generated table is activated, the ARM64
-   Jailhouse integration cleans the VJ-owned table pool, applies the required
+   Jailhouse integration compile-time routes every cell, including the root,
+   directly to VeriHyMem, cleans the VJ-owned table pool, applies the required
    barriers, programs VTCR_EL2/VTTBR_EL2, and invalidates the current VMID's
    stage-1/stage-2 translations. Correct CPU and IOMMU behavior remains outside
    the VeriHyMem proof.
@@ -54,4 +55,7 @@ The current proof boundary does not establish:
 - semantic coverage of shared memory, `COMM_REGION`, loadable memory, MMIO, subpage mappings, DMA/IOMMU mappings, or huge pages; or
 - full-system isolation against a malicious Jailhouse configuration or a bug in code outside VeriHyMem's verified components.
 
-Here, "full drop-in" means that the prototype will exercise VeriHyMem through Jailhouse's complete cell lifecycle and replace the selected executable memory management path. It does not mean that the entire integration is end-to-end verified. Closing the assumptions above is future work toward full security.
+The prototype replaces the selected CPU and SMMUv3 page-table paths for the
+QEMU experiment; it does not claim precise behavioral equivalence with every
+Jailhouse backend or end-to-end verification of the integration. Closing the
+assumptions above is future work toward full security.

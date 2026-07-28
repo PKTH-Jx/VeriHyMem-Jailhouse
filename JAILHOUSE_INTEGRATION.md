@@ -654,10 +654,10 @@ when switching between original and integrated compiler flags. `make clean
 KDIR=/absolute/path/to/linux-build` cleans both Cargo outputs and Jailhouse;
 without `KDIR`, the root `clean` target cleans Cargo outputs only.
 
-## 6. Page-Table Integration Plan
+## 6. Page-Table Integration
 
-Do the page-table work in two checkpoints so a descriptor or maintenance bug
-cannot silently replace the table currently protecting the root cell.
+The replacement was developed in two checkpoints before enabling VeriHyMem for
+the root cell as well.
 
 ### Shadow checkpoint
 
@@ -666,12 +666,13 @@ cannot silently replace the table currently protecting the root cell.
    Jailhouse `page_offset` to `vj_global_frame_allocator_init`. The allocator
    base is deliberately the HVA; `PageTableMem` subtracts `page_offset` when
    storing table/root physical addresses.
-2. Add an opaque VeriHyMem handle to ARM's `struct arch_cell`. Create it beside
-   the original allocation in `arm_paging_cell_init`, while leaving
-   `cell->arch.mm.root_table` active.
-3. Mirror supported 4 KiB regions from `arch_map_memory_region` and
-   `arch_unmap_memory_region` into `vj_pt_map_page`/`vj_pt_unmap_page`. Expand
-   regions page by page and translate Jailhouse flags into `vj_map_attrs`.
+2. Add opaque CPU and IOMMU VeriHyMem handles to ARM's `struct arch_cell`.
+   Integrated cells, including the root, do not allocate
+   `cell->arch.mm.root_table`.
+3. Route supported 4 KiB CPU regions from `arch_map_memory_region` and
+   `arch_unmap_memory_region` into the CPU handle. Route DMA regions through
+   the separate IOMMU handle. Expand regions page by page and translate
+   Jailhouse flags into `vj_map_attrs`.
 4. The shadow checkpoint compared `vj_pt_query` with `paging_virt2phys` for
    every mapped page and completed a create/load/start/destroy QEMU lifecycle.
    That comparison was test-only and is no longer part of production cell
@@ -681,21 +682,40 @@ cannot silently replace the table currently protecting the root cell.
 
 ### Activation checkpoint
 
-ARM64 now uses the VJ table when initializing a vCPU for a non-root cell. The
-handoff is in `arm_paging_vcpu_init`: `vj_paging_vcpu_init` cleans the dedicated
-VJ table pool, executes the required DSB/ISB barriers, programs VTCR_EL2 for
-the table's IPA width, programs VTTBR_EL2 with the cell VMID and cached root
-physical address, and performs a VMID-scoped stage-1/stage-2 TLB invalidation.
-Parking and the root cell continue to use Jailhouse's original structures.
+ARM64 uses the VJ CPU table when initializing every cell vCPU, including a root
+cell CPU. The handoff is compile-time selected: an integrated vCPU calls
+`vj_paging_vcpu_init` directly instead of passing `cell->arch.mm` through
+Jailhouse's native VTTBR routine. The VJ routine cleans the dedicated table
+pool, executes the required DSB/ISB barriers, programs VTCR_EL2 for the table's
+IPA width, programs VTTBR_EL2 with the cell VMID and cached root physical
+address, and performs a VMID-scoped stage-1/stage-2 TLB invalidation. All
+integrated cell create/map/unmap/query/destroy operations are compile-time
+routed exclusively to VJ, and the native root and geometry pointers remain
+null. Jailhouse's EL2, temporary-mapping, and CPU-parking tables continue to
+use the original paging implementation. Initial root construction remains
+inactive until all root regions are populated; each root CPU installs the
+finalized VJ table at the final VMM activation boundary.
 
-The VJ table currently has a fixed 39-bit IPA geometry and 4 KiB mappings. The
-original Jailhouse table remains populated in parallel, which keeps rollback
-and shadow comparison available while multicore and IOMMU/device coverage is
-completed.
+Cells, including the root cell, with assigned stream IDs on an SMMUv3 system
+receive a second VJ client containing only DMA regions. SMMUv3 stream-table
+entries use that client's 39-bit VTCR geometry and root PA; they never reuse
+the CPU client. SMMUv3 is the sole VeriHyMem IOMMU backend; integrated builds
+reject SMMUv2/MMU-500 and PVU configurations. The experimental runtime target
+is QEMU `virt` with GICv3 and SMMUv3. Table mutations clean the shared VJ frame
+pool before an IOMMU can walk it. Configuration commits invalidate both the
+root VMID, whose DMA ownership changes during cell transitions, and the
+affected non-root VMID.
 
 The current wrapper supports only 4 KiB mappings. It can construct a 39-bit
 three-level table or a 44--48-bit four-level table; Jailhouse currently creates
-the three-level form for each non-root cell and caches its physical root.
-Jailhouse's huge pages, subpage regions, executable/XN behavior, and IOMMU
-tables remain outside the VJ replacement scope. The trusted assumptions are recorded in
+the three-level form for each CPU and IOMMU client. The default dedicated pool
+uses all 4096 pages (16 MiB) supported by `BitAlloc4K`. The QEMU system
+configuration reserves 32 MiB for the integrated hypervisor so that the frame
+pool does not consume the complete Jailhouse reservation. The integrated ARM64
+bootstrap maps that complete 32 MiB reservation before C initialization, so
+VeriHyMem can safely zero and initialize the pool before the permanent EL2
+table is installed.
+Jailhouse's huge pages, subpage regions, executable/XN behavior, physical
+SMMU implementations, and PVU remain outside the VJ replacement scope. The
+trusted assumptions are recorded in
 `PROOF_BOUNDARY.md`.
