@@ -81,7 +81,17 @@ QEMU_EXTRA_ARGS ?=
 VJ_FRAME_POOL_PAGES ?= 4096
 
 VJ_ENTRY_POINTS := \
-	vj_global_frame_allocator_init \
+	vj_runtime_init \
+	vj_hv_add_zone \
+	vj_hv_remove_zone \
+	vj_hv_map_region \
+	vj_hv_unmap_region \
+	vj_hv_query \
+	vj_hv_pt_root \
+	vj_hv_iommu_map_region \
+	vj_hv_iommu_unmap_region \
+	vj_hv_iommu_query \
+	vj_hv_iommu_pt_root \
 	vj_pt_create \
 	vj_pt_map_page \
 	vj_pt_unmap_page \

@@ -45,7 +45,7 @@ uint64_t vj_paging_vtcr(const struct vj_paging_structures *pg_structs);
  * overlap JailhouseHeapAllocator storage. Pool exhaustion is outside the
  * prototype contract and may abort rather than return an allocation error.
  */
-int32_t vj_global_frame_allocator_init(
+int32_t vj_runtime_init(
 						uintptr_t frame_pool_hva_base,
 						uintptr_t frame_pool_frame_count,
 						uintptr_t hva_to_pa_offset);
@@ -64,6 +64,30 @@ struct vj_mapping {
 	struct vj_map_attrs attrs;
 };
 
+/*
+ * VeriHyMem-managed non-root cells. Zone IDs are Jailhouse cell IDs in the
+ * range 1..255. Regions are non-empty and 4 KiB aligned/granular; unmap is
+ * keyed by the IPA at which the original region begins.
+ */
+int32_t vj_hv_add_zone(uintptr_t zone_id);
+int32_t vj_hv_remove_zone(uintptr_t zone_id);
+int32_t vj_hv_map_region(uintptr_t zone_id, uintptr_t ipa_start,
+				 uintptr_t pa_start, uintptr_t size,
+				 struct vj_map_attrs attrs);
+int32_t vj_hv_unmap_region(uintptr_t zone_id, uintptr_t ipa_start);
+int32_t vj_hv_query(uintptr_t zone_id, uintptr_t ipa,
+			    struct vj_mapping *out);
+int32_t vj_hv_pt_root(uintptr_t zone_id, uintptr_t *out_root_pa);
+int32_t vj_hv_iommu_map_region(uintptr_t zone_id, uintptr_t ipa_start,
+				       uintptr_t pa_start, uintptr_t size,
+				       struct vj_map_attrs attrs);
+int32_t vj_hv_iommu_unmap_region(uintptr_t zone_id, uintptr_t ipa_start);
+int32_t vj_hv_iommu_query(uintptr_t zone_id, uintptr_t ipa,
+				  struct vj_mapping *out);
+int32_t vj_hv_iommu_pt_root(uintptr_t zone_id,
+				    uintptr_t *out_root_pa);
+
+/* vj_runtime_init must run before creating page tables. */
 int32_t vj_pt_create(uintptr_t frame_pool_hva_base,
 						     uintptr_t frame_pool_frame_count,
 						     uintptr_t hva_to_pa_offset,

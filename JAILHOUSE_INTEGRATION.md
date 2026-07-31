@@ -663,8 +663,8 @@ the root cell as well.
 
 1. During `paging_init`, reserve a fixed, page-aligned run from `mem_pool` for
    VeriHyMem and never return it to Jailhouse. Pass its HVA, frame count, and
-   Jailhouse `page_offset` to `vj_global_frame_allocator_init`. The allocator
-   base is deliberately the HVA; `PageTableMem` subtracts `page_offset` when
+   Jailhouse `page_offset` to `vj_runtime_init`. The runtime base is
+   deliberately the HVA; `PageTableMem` subtracts `page_offset` when
    storing table/root physical addresses.
 2. Add opaque CPU and IOMMU VeriHyMem handles to ARM's `struct arch_cell`.
    Integrated cells, including the root, do not allocate
