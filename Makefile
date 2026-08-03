@@ -86,15 +86,15 @@ VJ_ENTRY_POINTS := \
 	vj_hv_remove_zone \
 	vj_hv_map_region \
 	vj_hv_unmap_region \
-	vj_hv_query \
+	vj_hv_query_vaddr \
 	vj_hv_pt_root \
 	vj_hv_iommu_map_region \
 	vj_hv_iommu_unmap_region \
-	vj_hv_iommu_query \
+	vj_hv_iommu_query_vaddr \
 	vj_hv_iommu_pt_root \
 	vj_pt_create \
-	vj_pt_map_page \
-	vj_pt_unmap_page \
+	vj_pt_map \
+	vj_pt_unmap \
 	vj_pt_query \
 	vj_pt_root_pa \
 	vj_pt_mapped_pages \

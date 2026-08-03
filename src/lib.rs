@@ -89,6 +89,7 @@ fn page_table_constants(ipa_bits: u8, hva_to_pa_offset: usize) -> PTConstants {
     ]);
     PTConstants {
         arch: PTArch(levels),
+        huge_pages: true,
         hva_to_pa_offset,
     }
 }
@@ -223,6 +224,14 @@ pub struct CMapping {
     pub attrs: CMapAttrs,
 }
 
+/// C wire representation of an address translated through an HvMem region set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct CQueryResult {
+    pub paddr: usize,
+    pub attrs: CMapAttrs,
+}
+
 /// One executable VeriHyMem page table backed by the dedicated global frame pool.
 pub struct JailhousePageTable {
     page_table: ConcretePageTable,
@@ -256,13 +265,14 @@ impl JailhousePageTable {
         self.page_table.root().0
     }
 
-    pub fn map_page(&mut self, ipa: usize, pa: usize, attrs: MemAttr) -> Result<(), Error> {
-        self.validate_ipa_page(ipa)?;
-        validate_pa_page(pa)?;
+    pub fn map(&mut self, ipa: usize, pa: usize, size: usize, attrs: MemAttr) -> Result<(), Error> {
+        let frame_size = to_frame_size(size)?;
+        self.validate_ipa_mapping(ipa, size)?;
+        validate_pa_mapping(pa, size)?;
 
         let frame = Frame {
             base: PAddr(pa),
-            size: FrameSize::Size4K,
+            size: frame_size,
             attr: attrs,
         };
         let Some(runtime) = VJ_RUNTIME.get() else {
@@ -271,19 +281,21 @@ impl JailhousePageTable {
         self.page_table
             .map(&runtime.hv_mem.allocator, VAddr(ipa), frame)
             .map_err(|_| Error::AlreadyMapped)?;
-        self.mapped_pages += 1;
+        self.mapped_pages += size / PAGE_SIZE;
         Ok(())
     }
 
-    pub fn unmap_page(&mut self, ipa: usize) -> Result<(), Error> {
+    pub fn unmap(&mut self, ipa: usize) -> Result<(), Error> {
         self.validate_ipa_page(ipa)?;
         let Some(runtime) = VJ_RUNTIME.get() else {
             return Err(Error::Busy);
         };
-        self.page_table
+        let frame = self
+            .page_table
             .unmap(&runtime.hv_mem.allocator, VAddr(ipa))
             .map_err(|_| Error::NotMapped)?;
-        self.mapped_pages -= 1;
+        let mapped_pages = frame.size.as_usize() / PAGE_SIZE;
+        self.mapped_pages -= mapped_pages;
         Ok(())
     }
 
@@ -331,6 +343,14 @@ impl JailhousePageTable {
         }
         Ok(())
     }
+
+    fn validate_ipa_mapping(&self, ipa: usize, size: usize) -> Result<(), Error> {
+        self.validate_ipa(ipa)?;
+        if ipa % size != 0 || size > (1usize << self.ipa_bits) - ipa {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
+    }
 }
 
 fn validate_global_frame_pool(
@@ -372,6 +392,22 @@ fn validate_global_frame_pool(
 
 fn validate_pa_page(pa: usize) -> Result<(), Error> {
     if pa % PAGE_SIZE != 0 || pa > MAX_PA - (PAGE_SIZE - 1) {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(())
+}
+
+fn to_frame_size(size: usize) -> Result<FrameSize, Error> {
+    match size {
+        0x1000 => Ok(FrameSize::Size4K),
+        0x20_0000 => Ok(FrameSize::Size2M),
+        0x4000_0000 => Ok(FrameSize::Size1G),
+        _ => Err(Error::InvalidArgument),
+    }
+}
+
+fn validate_pa_mapping(pa: usize, size: usize) -> Result<(), Error> {
+    if pa % size != 0 || pa > MAX_PA - (size - 1) {
         return Err(Error::InvalidArgument);
     }
     Ok(())
@@ -452,15 +488,6 @@ fn zone_unmap_key(ipa_start: usize) -> Result<MemoryRegion, Error> {
         pages: 1,
         attr: MemAttr::new(false, false, false, false),
     })
-}
-
-fn mapping_from_query(ipa_base: VAddr, frame: Frame) -> CMapping {
-    CMapping {
-        ipa_base: ipa_base.0,
-        pa_base: frame.base.0,
-        size: frame.size.as_usize(),
-        attrs: frame.attr.into(),
-    }
 }
 
 /// Initialize the global frame allocator from its dedicated frame pool.
@@ -576,9 +603,13 @@ pub extern "C" fn vj_hv_unmap_region(zone_id: usize, ipa_start: usize) -> i32 {
     }
 }
 
-/// Query one CPU stage-2 mapping in a non-root zone.
+/// Translate one CPU stage-2 virtual address in a non-root zone.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn vj_hv_query(zone_id: usize, ipa: usize, out: *mut CMapping) -> i32 {
+pub unsafe extern "C" fn vj_hv_query_vaddr(
+    zone_id: usize,
+    ipa: usize,
+    out: *mut CQueryResult,
+) -> i32 {
     if let Err(err) = validate_zone_id(zone_id).and_then(|()| validate_zone_ipa(ipa)) {
         return err as i32;
     }
@@ -589,9 +620,12 @@ pub unsafe extern "C" fn vj_hv_query(zone_id: usize, ipa: usize, out: *mut CMapp
         Ok(runtime) => runtime,
         Err(err) => return err as i32,
     };
-    match runtime.hv_mem.pt_query(zone_id, VAddr(ipa)) {
-        Ok((ipa_base, frame)) => {
-            *out = mapping_from_query(ipa_base, frame);
+    match runtime.hv_mem.query_vaddr(zone_id, VAddr(ipa)) {
+        Ok((paddr, attrs)) => {
+            *out = CQueryResult {
+                paddr: paddr.0,
+                attrs: attrs.into(),
+            };
             0
         }
         Err(()) => Error::NotMapped as i32,
@@ -670,9 +704,13 @@ pub extern "C" fn vj_hv_iommu_unmap_region(zone_id: usize, ipa_start: usize) -> 
     }
 }
 
-/// Query one IOMMU stage-2 mapping in a non-root zone.
+/// Translate one IOMMU stage-2 virtual address in a non-root zone.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn vj_hv_iommu_query(zone_id: usize, ipa: usize, out: *mut CMapping) -> i32 {
+pub unsafe extern "C" fn vj_hv_iommu_query_vaddr(
+    zone_id: usize,
+    ipa: usize,
+    out: *mut CQueryResult,
+) -> i32 {
     if let Err(err) = validate_zone_id(zone_id).and_then(|()| validate_zone_ipa(ipa)) {
         return err as i32;
     }
@@ -683,9 +721,12 @@ pub unsafe extern "C" fn vj_hv_iommu_query(zone_id: usize, ipa: usize, out: *mut
         Ok(runtime) => runtime,
         Err(err) => return err as i32,
     };
-    match runtime.hv_mem.iommu_pt_query(zone_id, VAddr(ipa)) {
-        Ok((ipa_base, frame)) => {
-            *out = mapping_from_query(ipa_base, frame);
+    match runtime.hv_mem.iommu_query_vaddr(zone_id, VAddr(ipa)) {
+        Ok((paddr, attrs)) => {
+            *out = CQueryResult {
+                paddr: paddr.0,
+                attrs: attrs.into(),
+            };
             0
         }
         Err(()) => Error::NotMapped as i32,
@@ -746,12 +787,13 @@ pub unsafe extern "C" fn vj_pt_create(
     0
 }
 
-/// Map one 4 KiB page into an opaque page-table instance.
+/// Map one aligned 4 KiB page, 2 MiB block, or 1 GiB block.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn vj_pt_map_page(
+pub unsafe extern "C" fn vj_pt_map(
     handle: *mut JailhousePageTable,
     ipa: usize,
     pa: usize,
+    size: usize,
     attrs: CMapAttrs,
 ) -> i32 {
     let Some(table) = (unsafe { handle.as_mut() }) else {
@@ -760,19 +802,19 @@ pub unsafe extern "C" fn vj_pt_map_page(
     let Ok(attrs) = MemAttr::try_from(attrs) else {
         return Error::InvalidArgument as i32;
     };
-    match table.map_page(ipa, pa, attrs) {
+    match table.map(ipa, pa, size, attrs) {
         Ok(()) => 0,
         Err(err) => err as i32,
     }
 }
 
-/// Unmap one 4 KiB page from an opaque page-table instance.
+/// Unmap the page or block whose virtual base is `ipa`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn vj_pt_unmap_page(handle: *mut JailhousePageTable, ipa: usize) -> i32 {
+pub unsafe extern "C" fn vj_pt_unmap(handle: *mut JailhousePageTable, ipa: usize) -> i32 {
     let Some(table) = (unsafe { handle.as_mut() }) else {
         return Error::InvalidArgument as i32;
     };
-    match table.unmap_page(ipa) {
+    match table.unmap(ipa) {
         Ok(()) => 0,
         Err(err) => err as i32,
     }
@@ -881,6 +923,7 @@ mod tests {
 
     #[test]
     fn c_abi_page_table_lifecycle_and_busy_destroy() {
+        assert!(page_table_constants(THREE_LEVEL_IPA_BITS, 0).huge_pages);
         assert_eq!(
             validate_global_frame_pool(0x1000_0000, 2048, 0, THREE_LEVEL_IPA_BITS),
             Ok(())
@@ -930,10 +973,11 @@ mod tests {
 
         assert_eq!(
             unsafe {
-                vj_pt_map_page(
+                vj_pt_map(
                     handle,
                     1usize << THREE_LEVEL_IPA_BITS,
                     0x8000,
+                    PAGE_SIZE,
                     CMapAttrs {
                         readable: 1,
                         writable: 1,
@@ -964,7 +1008,7 @@ mod tests {
             device: 0,
         };
         assert_eq!(
-            unsafe { vj_pt_map_page(handle, 0x4000, 0x8000, invalid_attrs) },
+            unsafe { vj_pt_map(handle, 0x4000, 0x8000, PAGE_SIZE, invalid_attrs) },
             Error::InvalidArgument as i32,
         );
 
@@ -974,9 +1018,12 @@ mod tests {
             executable: 0,
             device: 0,
         };
-        assert_eq!(unsafe { vj_pt_map_page(handle, 0x4000, 0x8000, attrs) }, 0,);
         assert_eq!(
-            unsafe { vj_pt_map_page(iommu_handle, 0x4000, 0xc000, attrs) },
+            unsafe { vj_pt_map(handle, 0x4000, 0x8000, PAGE_SIZE, attrs) },
+            0,
+        );
+        assert_eq!(
+            unsafe { vj_pt_map(iommu_handle, 0x4000, 0xc000, PAGE_SIZE, attrs) },
             0,
         );
 
@@ -998,6 +1045,43 @@ mod tests {
         assert_eq!(mapping.attrs.executable, 0);
         assert_eq!(mapping.attrs.device, 0);
 
+        let huge_page_size = FrameSize::Size2M.as_usize();
+        assert_eq!(
+            unsafe { vj_pt_map(handle, 0x20_0000, 0x40_0000, huge_page_size, attrs) },
+            0,
+        );
+        let mut huge_mapping = MaybeUninit::<CMapping>::uninit();
+        assert_eq!(
+            unsafe { vj_pt_query(handle, 0x20_1234, huge_mapping.as_mut_ptr()) },
+            0,
+        );
+        let huge_mapping = unsafe { huge_mapping.assume_init() };
+        assert_eq!(huge_mapping.ipa_base, 0x20_0000);
+        assert_eq!(huge_mapping.pa_base, 0x40_0000);
+        assert_eq!(huge_mapping.size, huge_page_size);
+        assert_eq!(unsafe { vj_pt_mapped_pages(handle, &mut mapped_pages) }, 0);
+        assert_eq!(mapped_pages, 1 + huge_page_size / PAGE_SIZE);
+
+        let gigantic_page_size = FrameSize::Size1G.as_usize();
+        assert_eq!(
+            unsafe { vj_pt_map(handle, 0x4000_0000, 0x8000_0000, gigantic_page_size, attrs,) },
+            0,
+        );
+        let mut gigantic_mapping = MaybeUninit::<CMapping>::uninit();
+        assert_eq!(
+            unsafe { vj_pt_query(handle, 0x4000_1234, gigantic_mapping.as_mut_ptr()) },
+            0,
+        );
+        let gigantic_mapping = unsafe { gigantic_mapping.assume_init() };
+        assert_eq!(gigantic_mapping.ipa_base, 0x4000_0000);
+        assert_eq!(gigantic_mapping.pa_base, 0x8000_0000);
+        assert_eq!(gigantic_mapping.size, gigantic_page_size);
+        assert_eq!(unsafe { vj_pt_mapped_pages(handle, &mut mapped_pages) }, 0);
+        assert_eq!(
+            mapped_pages,
+            1 + huge_page_size / PAGE_SIZE + gigantic_page_size / PAGE_SIZE
+        );
+
         // Non-root cells use the self-contained HvMem path. CPU and IOMMU
         // mappings are distinct, and a non-empty zone cannot be destroyed.
         assert_eq!(vj_hv_add_zone(0), Error::InvalidArgument as i32);
@@ -1014,29 +1098,30 @@ mod tests {
         assert_ne!(zone_root_pa, zone_iommu_root_pa);
 
         assert_eq!(
-            vj_hv_map_region(1, 0x8000, 0x20_0000, 2 * PAGE_SIZE, attrs),
+            vj_hv_map_region(1, 0x20_0000, 0x40_0000, huge_page_size, attrs),
             0
         );
         assert_eq!(
             vj_hv_iommu_map_region(1, 0x8000, 0x30_0000, PAGE_SIZE, attrs),
             0,
         );
-        let mut zone_mapping = MaybeUninit::<CMapping>::uninit();
+        let mut zone_query = MaybeUninit::<CQueryResult>::uninit();
         assert_eq!(
-            unsafe { vj_hv_query(1, 0x9001, zone_mapping.as_mut_ptr()) },
+            unsafe { vj_hv_query_vaddr(1, 0x20_1001, zone_query.as_mut_ptr()) },
             0,
         );
-        let zone_mapping = unsafe { zone_mapping.assume_init() };
-        assert_eq!(zone_mapping.ipa_base, 0x9000);
-        assert_eq!(zone_mapping.pa_base, 0x20_1000);
+        let zone_query = unsafe { zone_query.assume_init() };
+        assert_eq!(zone_query.paddr, 0x40_1001);
+        assert_eq!(zone_query.attrs, attrs);
 
-        let mut zone_iommu_mapping = MaybeUninit::<CMapping>::uninit();
+        let mut zone_iommu_query = MaybeUninit::<CQueryResult>::uninit();
         assert_eq!(
-            unsafe { vj_hv_iommu_query(1, 0x8000, zone_iommu_mapping.as_mut_ptr()) },
+            unsafe { vj_hv_iommu_query_vaddr(1, 0x8000, zone_iommu_query.as_mut_ptr()) },
             0,
         );
-        let zone_iommu_mapping = unsafe { zone_iommu_mapping.assume_init() };
-        assert_eq!(zone_iommu_mapping.pa_base, 0x30_0000);
+        let zone_iommu_query = unsafe { zone_iommu_query.assume_init() };
+        assert_eq!(zone_iommu_query.paddr, 0x30_0000);
+        assert_eq!(zone_iommu_query.attrs, attrs);
         assert_eq!(vj_hv_remove_zone(1), Error::Busy as i32);
         // CPU unmap executes the EL2 TLBI seam and therefore belongs in the
         // Jailhouse/QEMU integration test, not this EL0 host unit test.
@@ -1049,9 +1134,11 @@ mod tests {
         );
 
         // Busy destruction preserves the original handle, so it remains usable.
-        assert_eq!(unsafe { vj_pt_unmap_page(handle, 0x4000) }, 0);
+        assert_eq!(unsafe { vj_pt_unmap(handle, 0x4000_0000) }, 0);
+        assert_eq!(unsafe { vj_pt_unmap(handle, 0x20_0000) }, 0);
+        assert_eq!(unsafe { vj_pt_unmap(handle, 0x4000) }, 0);
         assert_eq!(unsafe { vj_pt_destroy(handle) }, 0);
-        assert_eq!(unsafe { vj_pt_unmap_page(iommu_handle, 0x4000) }, 0);
+        assert_eq!(unsafe { vj_pt_unmap(iommu_handle, 0x4000) }, 0);
         assert_eq!(unsafe { vj_pt_destroy(iommu_handle) }, 0);
     }
 }

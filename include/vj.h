@@ -64,6 +64,11 @@ struct vj_mapping {
 	struct vj_map_attrs attrs;
 };
 
+struct vj_query_result {
+	uintptr_t paddr;
+	struct vj_map_attrs attrs;
+};
+
 /*
  * VeriHyMem-managed non-root cells. Zone IDs are Jailhouse cell IDs in the
  * range 1..255. Regions are non-empty and 4 KiB aligned/granular; unmap is
@@ -75,15 +80,15 @@ int32_t vj_hv_map_region(uintptr_t zone_id, uintptr_t ipa_start,
 				 uintptr_t pa_start, uintptr_t size,
 				 struct vj_map_attrs attrs);
 int32_t vj_hv_unmap_region(uintptr_t zone_id, uintptr_t ipa_start);
-int32_t vj_hv_query(uintptr_t zone_id, uintptr_t ipa,
-			    struct vj_mapping *out);
+int32_t vj_hv_query_vaddr(uintptr_t zone_id, uintptr_t ipa,
+				  struct vj_query_result *out);
 int32_t vj_hv_pt_root(uintptr_t zone_id, uintptr_t *out_root_pa);
 int32_t vj_hv_iommu_map_region(uintptr_t zone_id, uintptr_t ipa_start,
 				       uintptr_t pa_start, uintptr_t size,
 				       struct vj_map_attrs attrs);
 int32_t vj_hv_iommu_unmap_region(uintptr_t zone_id, uintptr_t ipa_start);
-int32_t vj_hv_iommu_query(uintptr_t zone_id, uintptr_t ipa,
-				  struct vj_mapping *out);
+int32_t vj_hv_iommu_query_vaddr(uintptr_t zone_id, uintptr_t ipa,
+					struct vj_query_result *out);
 int32_t vj_hv_iommu_pt_root(uintptr_t zone_id,
 				    uintptr_t *out_root_pa);
 
@@ -93,10 +98,9 @@ int32_t vj_pt_create(uintptr_t frame_pool_hva_base,
 						     uintptr_t hva_to_pa_offset,
 						     uint8_t ipa_bits,
 						     void **out_handle);
-int32_t vj_pt_map_page(
-					void *handle, uintptr_t ipa, uintptr_t pa,
-					struct vj_map_attrs attrs);
-int32_t vj_pt_unmap_page(void *handle, uintptr_t ipa);
+int32_t vj_pt_map(void *handle, uintptr_t ipa, uintptr_t pa,
+			  uintptr_t size, struct vj_map_attrs attrs);
+int32_t vj_pt_unmap(void *handle, uintptr_t ipa);
 int32_t vj_pt_query(
 					const void *handle, uintptr_t ipa,
 					struct vj_mapping *out);

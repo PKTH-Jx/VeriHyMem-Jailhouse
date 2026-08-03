@@ -1,61 +1,51 @@
 # VeriHyMem-Jailhouse Prototype Proof Boundary
 
-This document states the proof boundary for the QEMU GICv3/SMMUv3 integration prototype. The VeriHyMem components retain their machine-checked proofs, but this wrapper and the Jailhouse C code are not verified with Verus. Consequently, the properties below are conditional on the Jailhouse integration assumptions; they are not an end-to-end theorem about the complete Jailhouse binary. SMMUv2/MMU-500 and PVU configurations are rejected by integrated builds.
+This document defines the boundary of the ARM64 GICv3/SMMUv3 integration. It is a conditional boundary for the verified VeriHyMem components, not an end-to-end theorem about the Rust/C wrapper or the Jailhouse binary. Integrated builds reject SMMUv2/MMU-500 and PVU configurations.
 
-## Two independent allocators
+## Integrated objects
 
-The integration deliberately has two allocators with different roles:
+The runtime has two different cell paths:
 
-- `GlobalFrameAllocator` is VeriHyMem's `GlobalAllocator<BitAlloc4K>`. It allocates 4 KiB page-table frames from one dedicated frame pool supplied by Jailhouse. VeriHyMem proves that registered allocator clients own disjoint frame sets. CPU and SMMUv3 IOMMU tables are separate clients; the integrated build reserves the allocator's full capacity of 4096 frames by default.
-- `JailhouseHeapAllocator` is Rust's global heap allocator. It obtains storage for executable metadata such as `Box<JailhousePageTable>` and the `Vec` used by `PTArch` through the unverified `vj_heap_alloc` and `vj_heap_dealloc` hooks.
+- The root cell owns standalone `JailhousePageTable` objects. Its CPU and, when needed, IOMMU tables use the `vj_pt_*` ABI.
+- Every non-root cell is one `HvMem` zone. A zone owns separate CPU and IOMMU `MemorySet`s, their page-table roots, the per-zone ownership state, and the CPU/IOMMU MMU synchronization tokens. The `vj_hv_*` ABI exposes this path.
+- Jailhouse's EL2, temporary-mapping, and CPU-parking tables remain native.
 
-The heap is not a client of `GlobalFrameAllocator`, and heap allocations are not covered by the allocator's client-disjointness proof.
+`MemorySet` is the verified region-plus-page-table layer: a region operation updates the region set and expands its dense 4 KiB mappings in the backing page table. `HvMem` maintains the zone registry and shared allocator. The outer `HvMem` lock protects the registry and zone lifetime; the inner `Zone` lock protects one zone's CPU and IOMMU state. Zone reads may run concurrently, and different zones may be mutated concurrently; zone creation/removal is serialized by the outer write lock. The global frame allocator has its own mutex for frame allocation.
 
-## Jailhouse assumptions
+## Trusted assumptions
 
-The current prototype assumes all of the following:
+The integration assumes:
 
-1. **Dedicated frame pool.** Jailhouse supplies a page-aligned, writable HVA range with static lifetime that is used only by `GlobalFrameAllocator`. Neither Jailhouse nor the Rust heap allocates from or writes to this range after the handoff.
-2. **Valid permission handoff.** The tracked permission introduced by `Tracked::assume_new()` represents exactly that concrete frame pool. This is the trusted bridge from unverified Jailhouse memory into VeriHyMem's proved allocator state.
-3. **Infallible frame allocation.** The dedicated pool contains enough free frames for every admitted execution. VeriHyMem intentionally assumes frame allocation succeeds. Exhaustion is outside the prototype guarantee and may abort the hypervisor; no allocation-error rollback property is claimed.
-4. **Independent heap contract.** Jailhouse's heap hooks honor the requested size and alignment, return uniquely owned live storage, preserve the dedicated frame pool, and accept the matching deallocation exactly once. Heap exhaustion may also abort.
-5. **Fixed HVA/PA direct map.** For every frame-pool address, subtracting `hva_to_pa_offset` yields the PA used in page-table entries and the root register, and adding it back yields the dereferenceable HVA. The conversion does not overflow and matches Jailhouse's `page_offset` mapping.
-6. **Valid C calls.** Jailhouse passes live, correctly aligned output pointers and opaque handles returned by `pt_create`; it does not forge, alias, reuse, or access a handle after successful destruction. Calls that mutate one handle are externally serialized.
-7. **Admitted mappings.** Jailhouse supplies page-aligned IPAs and PAs in the configured address width and assigns those mapped data frames to the target cell according to Jailhouse's own lifecycle rules. The raw page-table layer does not prove ownership of mapped data frames.
-8. **Matching architecture.** The active VJ configuration uses the AArch64
-   three-level, 4 KiB stage-2 layout and descriptor interpretation represented
-   by `PTArch` and `Aarch64PTE`.
-9. **Hardware activation.** Before a generated table is activated, the ARM64
-   Jailhouse integration compile-time routes every cell, including the root,
-   directly to VeriHyMem, cleans the VJ-owned table pool, applies the required
-   barriers, programs VTCR_EL2/VTTBR_EL2, and invalidates the current VMID's
-   stage-1/stage-2 translations. Correct CPU and IOMMU behavior remains outside
-   the VeriHyMem proof.
-10. **Abort semantics.** A Rust panic or violated infallibility assumption ends in `vj_abort`; recovery after an abort is not modeled.
+1. **Dedicated frame pool.** Jailhouse supplies a page-aligned, writable HVA range with static lifetime. After `vj_runtime_init`, only VeriHyMem's `GlobalAllocator<BitAlloc4K>` uses it.
+2. **Permission handoff and capacity.** `Tracked::assume_new()` describes exactly that pool, and the pool never exhausts. Exhaustion may abort; no allocation-failure rollback property is claimed.
+3. **Heap contract.** Jailhouse's `vj_heap_alloc`/`vj_heap_dealloc` hooks honor size, alignment, ownership, and matching deallocation. The Rust heap is independent of the page-table frame allocator.
+4. **Address conversion.** Subtracting `hva_to_pa_offset` converts every pool HVA to the PA used in descriptors and exported roots, and the reverse conversion yields a dereferenceable HVA.
+5. **Valid callers and lifecycle.** Jailhouse uses valid IDs in `1..=255` for non-root zones, valid aligned C arguments, and live handles. It maps and unmaps a non-root region before calling `vj_hv_remove_zone`; it externally serializes mutations of a root `vj_pt_*` handle. The wrapper and Jailhouse C code are not verified.
+6. **Admitted non-root regions.** For a zone `zid`, each CPU region belongs to `zone_regions(zid)` and each IOMMU region belongs to that set or the configured GIC region. The `BudgetProtocol` axioms supply validity and physical disjointness of configured regions, including cross-zone disjointness. These are assumptions at the unverified FFI boundary, not runtime ownership checks.
+7. **Architecture and activation.** The active configuration uses the AArch64 three-level, 39-bit, 4 KiB table represented by `PTArch` and `Aarch64PTE`. Jailhouse cleans the shared table pool and performs the required CPU and SMMUv3 activation/invalidation sequence before reuse. The AArch64 instruction bodies and handwritten assembly are outside the VeriHyMem proof.
 
-## Conditional properties established
+## Conditional properties
 
-Subject to the assumptions above, the integration reuses these proved VeriHyMem properties:
+Subject to those assumptions, the integrated VeriHyMem code provides:
 
-- Page-table frames allocated to distinct registered clients of `GlobalFrameAllocator` are disjoint. Multiple `JailhousePageTable` values may share the allocator without sharing their owned table frames.
-- Each page table remains structurally well formed: table frames are allocated from the dedicated pool, page-table mappings do not overlap, mapped bases are aligned to their frame size, and table mutation preserves the page-table invariants.
-- Executable `map`, `unmap`, and `query` operations refine VeriHyMem's abstract page-table transitions for the configured architecture.
-- Page-table memory is dereferenced through HVA while table descriptors and the exported root use PA, preserving the fixed-offset PA/HVA separation.
-- Destroying an empty handle returns all of that client's remaining page-table frames, including its root, to `GlobalFrameAllocator`. A `Busy` destruction leaves the original C handle live.
-- The C boundary rejects null handles/output pointers, non-Boolean attribute bytes, unaligned page addresses, and addresses outside the configured wrapper bounds before invoking the corresponding page-table operation.
+- structurally well-formed page tables and disjoint ownership of page-table frames allocated to distinct allocator clients;
+- exact correspondence between each admitted zone region and its page mappings, with no overlapping virtual regions within a memory set;
+- CPU and IOMMU translation confinement to the admitted physical regions, and cross-zone physical disjointness inherited from `BudgetProtocol`;
+- a unique live zone for each registered non-root cell ID, protection against zone removal while an `HvMem` read operation holds the outer lock, and serialized mutation of one zone's state under its inner lock;
+- synchronization-token refinement of CPU map/unmap maintenance and separate CPU/IOMMU page-table state; and
+- checked C-boundary arguments for the exported operations.
 
-## Properties not established by this prototype
+The root cell receives only the standalone page-table and allocator properties; it is deliberately outside the `HvMem` zone-level isolation properties.
 
-The current proof boundary does not establish:
+## Not established
 
-- memory safety or functional correctness of the Rust/C wrapper, the Jailhouse C caller, the heap hooks, compiler, linker, or handwritten assembly;
-- availability under frame-pool or heap exhaustion, or transactional rollback after allocation failure;
-- ownership or disjointness of the guest data frames passed to `pt_map_page`;
-- correct cache, TLB, VMID, VTTBR, or multicore behavior;
-- semantic coverage of shared memory, `COMM_REGION`, loadable memory, MMIO, subpage mappings, DMA/IOMMU mappings, or huge pages; or
-- full-system isolation against a malicious Jailhouse configuration or a bug in code outside VeriHyMem's verified components.
+This prototype does not establish:
 
-The prototype replaces the selected CPU and SMMUv3 page-table paths for the
-QEMU experiment; it does not claim precise behavioral equivalence with every
-Jailhouse backend or end-to-end verification of the integration. Closing the
-assumptions above is future work toward full security.
+- memory safety or functional correctness of the wrapper, Jailhouse C code, allocator hooks, compiler, linker, or assembly;
+- that Jailhouse's physical cell assignment satisfies the admitted-region premises, or that guest data frames are owned exclusively by their target cell;
+- correct cache, TLB, VMID, VTTBR, SMMU command-queue, or multicore hardware behavior;
+- transactional recovery after frame-pool or heap exhaustion;
+- semantics for huge pages, subpage MMIO, shared/communication regions, executable/XN behavior, or non-SMMUv3 IOMMU backends; or
+- full-system isolation against a malformed configuration or a bug outside the verified VeriHyMem modules.
+
+The integration therefore replaces selected Jailhouse CPU and SMMUv3 translation backends. It does not replace Jailhouse's cell lifecycle, configuration validation, physical-memory transfer, or device-management framework.
